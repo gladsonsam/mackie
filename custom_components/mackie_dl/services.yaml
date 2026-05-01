@@ -1,0 +1,99 @@
+set_input_mute:
+  name: Set input mute
+  description: Mute/unmute an input channel.
+  fields:
+    channel:
+      name: Channel
+      description: Input channel number (1-based).
+      required: true
+      example: 1
+      selector:
+        number:
+          min: 1
+          max: 32
+          mode: box
+    muted:
+      name: Muted
+      description: True to mute, false to unmute.
+      required: true
+      example: true
+      selector:
+        boolean: {}
+
+set_input_fader:
+  name: Set input fader
+  description: Set the input channel fader level (0.0 to 1.0) for LR.
+  fields:
+    channel:
+      name: Channel
+      description: Input channel number (1-based).
+      required: true
+      example: 1
+      selector:
+        number:
+          min: 1
+          max: 32
+          mode: box
+    level:
+      name: Level
+      description: Fader level from 0.0 to 1.0.
+      required: true
+      example: 0.75
+      selector:
+        number:
+          min: 0
+          max: 1
+          step: 0.01
+          mode: slider
+
+recall_snapshot:
+  name: Recall snapshot
+  description: Recall a snapshot (requires configuring the snapshot recall address).
+  fields:
+    snapshot:
+      name: Snapshot
+      description: Snapshot number (1-based).
+      required: true
+      example: 1
+      selector:
+        number:
+          min: 1
+          max: 64
+          mode: box
+
+raw_set_value:
+  name: Raw set value
+  description: Advanced. Write a single value to a Mackie 'channel values' address.
+  fields:
+    address:
+      name: Address
+      description: Address in the Mackie value space.
+      required: true
+      example: 1
+      selector:
+        number:
+          min: 0
+          max: 100000
+          mode: box
+    int_value:
+      name: Integer value
+      description: Optional 32-bit integer value to write.
+      required: false
+      example: 1
+      selector:
+        number:
+          min: -2147483648
+          max: 2147483647
+          mode: box
+    float_value:
+      name: Float value
+      description: Optional float value to write (0.0–1.0 etc, depends on address).
+      required: false
+      example: 0.5
+      selector:
+        number:
+          min: -1000
+          max: 1000
+          step: 0.001
+          mode: box
+
