@@ -1,0 +1,18 @@
+{
+  "title": "Mackie DL (TCP)",
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to mixer",
+        "description": "Enter your mixer IP/hostname and TCP port (default 50001).",
+        "data": {
+          "host": "Host",
+          "port": "Port",
+          "channels": "Number of input channels",
+          "snapshot_recall_address": "Snapshot recall address (advanced)"
+        }
+      }
+    }
+  }
+}
+
