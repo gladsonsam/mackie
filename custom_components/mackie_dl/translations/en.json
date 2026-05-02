@@ -4,15 +4,48 @@
     "step": {
       "user": {
         "title": "Connect to mixer",
-        "description": "Enter your mixer IP/hostname and TCP port (default 50001).",
+        "description": "TCP control on port 50001. Connection is tested before the integration is saved.",
         "data": {
           "host": "Host",
           "port": "Port",
+          "device_name": "Device name (optional)",
           "channels": "Number of input channels",
-          "snapshot_recall_address": "Snapshot recall address (advanced)"
+          "mixer_model": "Mixer model (address map)",
+          "snapshot_slots": "Show snapshot list size (1–64)",
+          "snapshot_recall_address": "Snapshot recall address (0 = Master Fader protocol)"
         }
+      },
+      "reconfigure": {
+        "title": "Reconfigure Mackie mixer",
+        "description": "Update connection settings or snapshot options. The connection is tested before saving."
+      }
+    },
+    "error": {
+      "cannot_connect": "Could not connect to the mixer. Check host, port, Wi‑Fi/Ethernet, and that the mixer is on."
+    },
+    "abort": {
+      "already_configured": "This mixer (host) is already configured.",
+      "reconfigured": "Settings saved; integration reloaded."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Snapshot & display",
+        "description": "These settings apply immediately when saved (integration reloads). Use Reconfigure on the integration to change IP or mixer model.",
+        "data": {
+          "device_name": "Device name (optional)",
+          "snapshot_slots": "Show snapshot list size (1–64)",
+          "snapshot_recall_address": "Snapshot recall address (0 = Master Fader protocol)"
+        }
+      }
+    }
+  },
+  "entity": {
+    "select": {
+      "show_snapshot": {
+        "name": "Show snapshot"
       }
     }
   }
 }
-

@@ -22,7 +22,7 @@ set_input_mute:
 
 set_input_fader:
   name: Set input fader
-  description: Set the input channel fader level (0.0 to 1.0) for LR.
+  description: Set the input channel fader level percent (0-100) for LR.
   fields:
     channel:
       name: Channel
@@ -36,19 +36,19 @@ set_input_fader:
           mode: box
     level:
       name: Level
-      description: Fader level from 0.0 to 1.0.
+      description: Fader level percentage (0-100).
       required: true
-      example: 0.75
+      example: 50
       selector:
         number:
           min: 0
-          max: 1
-          step: 0.01
+          max: 100
+          step: 1
           mode: slider
 
 recall_snapshot:
   name: Recall snapshot
-  description: Recall a snapshot (requires configuring the snapshot recall address).
+  description: Recall a show snapshot. Leave snapshot recall address at 0 to use the Master Fader protocol (DL16S/DL32S); set a non-zero address only for legacy CHANNEL_VALUES recall on some mixers.
   fields:
     snapshot:
       name: Snapshot
@@ -87,7 +87,7 @@ raw_set_value:
           mode: box
     float_value:
       name: Float value
-      description: Optional float value to write (0.0–1.0 etc, depends on address).
+      description: Optional float (fader addresses use dB, matching DigiMixer / Mackie app).
       required: false
       example: 0.5
       selector:
