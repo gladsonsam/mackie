@@ -1,26 +1,30 @@
-## Home Assistant → Mackie DL32S control (Python)
+# Mackie DL → Home Assistant
 
-This repo contains a **Home Assistant custom integration** that controls a Mackie DL-series mixer (DL32S expected) over the (undocumented) Mackie TCP protocol described in Jon Skeet’s DigiMixer notes.
+Custom integration for **Mackie DL-series** mixers over TCP (**port 50001**): mute + LR fader per input, optional **show snapshot** recall, and services for scripts/automations.
 
-### What you get
 
-- **Mute switches** for input channels 1–32
-- **Fader level numbers** (0.0–1.0) for input channels 1–32 (LR send)
-- Home Assistant services to set mute/fader directly
-- A **snapshot recall service** (needs the correct recall address)
+## Install
 
-### Install (manual)
-
-1. Copy `custom_components/mackie_dl` into your Home Assistant config directory:
-  - `config/custom_components/mackie_dl`
+1. Copy [`custom_components/mackie_dl`](custom_components/mackie_dl) into your HA config as `config/custom_components/mackie_dl`.
 2. Restart Home Assistant.
-3. Add the integration via **Settings → Devices & services → Add integration → “Mackie DL (TCP)”**.
+3. **Settings → Devices & services → Add integration → Mackie DL (TCP)**.
 
-### Notes / caveats
+Pick **mixer model** (`dl32s`, `dl16s`, `dl32r`, or `auto`). Connection is tested during setup.
 
-- The Mackie protocol is reverse engineered. This integration targets the basic “channel values” mechanism (mute + LR fader) and may need tweaks once you can test against your DL32S.
-- Default mixer TCP port is **50001**.
-- **Snapshot recall**: the public reverse-engineered notes we’re using don’t include the snapshot recall address yet. The integration therefore exposes:
-  - `mackie_dl.recall_snapshot` (writes the snapshot number to your configured `snapshot_recall_address`)
-  - `mackie_dl.raw_set_value` (so you can experiment/capture and then lock in the correct address)
+## Features (short)
+
+| Area | What |
+|------|------|
+| **Device** | One device per mixer; optional friendly **device name**. |
+| **Entities** | Per-channel **mute** (switch) and **LR level** (number, %). **Show snapshot** (select, Configuration) recalls Master Fader snapshots. |
+| **Integration menu** | **Configure** (options): snapshot list length, recall mode, device name. **Reconfigure**: host, port, channels, model, snapshots. |
+| **Services** | `set_input_mute`, `set_input_fader`, `recall_snapshot`, `raw_set_value`. |
+
+**Snapshots:** leave **snapshot recall address** at **0** to use the **Master Fader** wire sequence (cmd `0x07`). Non-zero uses a legacy single **CHANNEL_VALUES** write for unusual setups.
+
+## CLI & reference
+
+Repo includes [`tools/mackie_cli.py`](tools/mackie_cli.py) (e.g. `recall-snapshot`, `mute`, `fader`) and [`tools/parse_pcap_mackie.py`](tools/parse_pcap_mackie.py) for captures.
+
+**Protocol, addressing, and HA internals:** [`custom_components/mackie_dl/SPEC.md`](custom_components/mackie_dl/SPEC.md).
 
