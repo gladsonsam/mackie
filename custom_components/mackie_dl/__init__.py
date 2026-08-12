@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import struct
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_HOST, CONF_PORT
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, ServiceResponse, SupportsResponse
 from homeassistant.helpers import entity_registry as er
 
+from .addressmap import get_map
 from .client import MackieClient, MackieCommand
 from .const import (
     CONF_CHANNELS,
@@ -21,13 +23,24 @@ from .const import (
     DEFAULT_SNAPSHOT_SLOTS,
     DOMAIN,
     MAX_INPUT_CHANNELS,
+    SERVICE_GET_PARAMETER,
     SERVICE_RECALL_SNAPSHOT,
     SERVICE_RAW_SET_VALUE,
     SERVICE_SET_INPUT_FADER,
     SERVICE_SET_INPUT_MUTE,
+    SERVICE_SET_PARAMETER,
 )
 
 PLATFORMS: list[str] = ["switch", "number", "select"]
+
+
+def _as_bool(value) -> bool:
+    """Accept the several shapes HA hands a boolean through a service call."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
 
 
 def _remove_legacy_mackie_entities(hass: HomeAssistant, config_entry_id: str) -> None:
@@ -161,6 +174,68 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             await client.raw_set_value_float(addr, float(call.data["float_value"]))
         else:
             raise ValueError("Provide either int_value or float_value")
+
+    # --- map-driven generic access ------------------------------------------
+    # These two reach every field in addressmap.py. Adding a parameter to the map
+    # makes it callable here immediately - no new service, no new entity.
+    mixer_map = get_map(str(mixer_model))
+
+    def _resolve(call):
+        ch = int(call.data["channel"])
+        key = str(call.data["field"])
+        block = mixer_map.inputs
+        return block, block.field(key), block.address(ch, key)
+
+    async def handle_set_parameter(call):
+        block, fld, address = _resolve(call)
+        value = call.data["value"]
+
+        if fld.encoding == "bool":
+            await client.raw_set_value_int(address, 1 if _as_bool(value) else 0)
+            return
+        if fld.encoding in ("enum", "int"):
+            await client.raw_set_value_int(address, int(value))
+            return
+
+        num = float(value)
+        if fld.limits is not None and not fld.limits[0] <= num <= fld.limits[1]:
+            raise ValueError(
+                f"{fld.key} must be within {fld.limits[0]}..{fld.limits[1]}, got {num}"
+            )
+        await client.raw_set_value_float(address, num)
+
+    async def handle_get_parameter(call) -> ServiceResponse:
+        """Read from the client's cache, which the mixer keeps current by push."""
+        block, fld, address = _resolve(call)
+        raw = client.get_cached_u32(address)
+        if raw is None:
+            return {"address": address, "field": fld.key, "value": None,
+                    "available": False}
+        if fld.encoding in ("db", "float"):
+            value: float | int | bool = struct.unpack(">f", struct.pack(">I", raw))[0]
+        elif fld.encoding == "bool":
+            value = bool(raw)
+        else:
+            value = raw
+        return {
+            "address": address,
+            "field": fld.key,
+            "label": fld.label,
+            "encoding": fld.encoding,
+            "value": value,
+            "verified": fld.verified,
+            "available": True,
+        }
+
+    if not hass.services.has_service(DOMAIN, SERVICE_SET_PARAMETER):
+        hass.services.async_register(DOMAIN, SERVICE_SET_PARAMETER, handle_set_parameter)
+    if not hass.services.has_service(DOMAIN, SERVICE_GET_PARAMETER):
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_GET_PARAMETER,
+            handle_get_parameter,
+            supports_response=SupportsResponse.ONLY,
+        )
 
     if not hass.services.has_service(DOMAIN, SERVICE_SET_INPUT_MUTE):
         hass.services.async_register(DOMAIN, SERVICE_SET_INPUT_MUTE, handle_set_mute)
