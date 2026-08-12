@@ -33,6 +33,10 @@ SERVICE_SET_INPUT_MUTE = "set_input_mute"
 SERVICE_SET_INPUT_FADER = "set_input_fader"
 SERVICE_RECALL_SNAPSHOT = "recall_snapshot"
 SERVICE_RAW_SET_VALUE = "raw_set_value"
+# Map-driven generic access: reaches every field in addressmap.py without needing
+# a dedicated service or entity per parameter. See SPEC.md, "Coverage vs surface".
+SERVICE_SET_PARAMETER = "set_parameter"
+SERVICE_GET_PARAMETER = "get_parameter"
 
 
 def config_entry_merged(entry) -> dict:

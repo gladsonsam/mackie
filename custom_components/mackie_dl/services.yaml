@@ -61,6 +61,67 @@ recall_snapshot:
           max: 64
           mode: box
 
+set_parameter:
+  name: Set parameter
+  description: >-
+    Set any mapped parameter on an input channel by name - gain, phantom, HPF, gate,
+    comp, the four EQ bands, the eight aux sends and the four FX sends. The address is
+    resolved from the mixer model's address map, so no per-parameter service is needed.
+    Field names are listed in SPEC.md.
+  fields:
+    channel:
+      name: Channel
+      description: Input channel number (1-based).
+      required: true
+      example: 1
+      selector:
+        number:
+          min: 1
+          max: 32
+          mode: box
+    field:
+      name: Field
+      description: >-
+        Parameter key, e.g. gain, phantom, hpf_freq, eq2_gain, aux3_level, fx1_mute.
+      required: true
+      example: gain
+      selector:
+        text: {}
+    value:
+      name: Value
+      description: >-
+        Natural units - dB for levels and gains, Hz for frequencies, true/false for
+        switches. Values outside a field's known range are rejected.
+      required: true
+      example: 12
+      selector:
+        text: {}
+
+get_parameter:
+  name: Get parameter
+  description: >-
+    Read any mapped parameter from the locally cached mixer state (the mixer pushes
+    changes, so the cache tracks the desk). Returns the value, its address and whether
+    the field's meaning has been verified against hardware.
+  fields:
+    channel:
+      name: Channel
+      description: Input channel number (1-based).
+      required: true
+      example: 1
+      selector:
+        number:
+          min: 1
+          max: 32
+          mode: box
+    field:
+      name: Field
+      description: Parameter key, e.g. gain, mute, eq1_freq, aux1_level.
+      required: true
+      example: gain
+      selector:
+        text: {}
+
 raw_set_value:
   name: Raw set value
   description: Advanced. Write a single value to a Mackie 'channel values' address.
