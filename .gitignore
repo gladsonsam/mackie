@@ -1,8 +1,8 @@
-# --- Local-only tooling (hosts, keys, paths — keep out of GitHub) ---
+# --- Local-only tooling (hosts, keys, paths - keep out of GitHub) ---
 tools/deploy_to_ha.ps1
 tools/deploy*.ps1
 
-# Local reference clone (jskeet/DemoCode — DigiMixer Mackie .NET; not vendored)
+# Local reference clone (jskeet/DemoCode - DigiMixer Mackie .NET; not vendored)
 reference/digimixer/
 
 # Python
