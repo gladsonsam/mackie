@@ -33,6 +33,11 @@ from .const import (
 
 PLATFORMS: list[str] = ["switch", "number", "select"]
 
+#: How often to ask the mixer to re-send its whole value space. State arrives by
+#: push, so this only guards against a dropped update; it is not how state is kept
+#: current. Each resync moves 5257 values on a DL32S.
+RESYNC_INTERVAL_SECONDS = 60
+
 
 def _as_bool(value) -> bool:
     """Accept the several shapes HA hands a boolean through a service call."""
@@ -114,14 +119,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     await client.connect()
 
     async def _poll_loop() -> None:
-        """
-        Polling fallback: periodically nudge the mixer to emit channel values.
+        """Periodically re-ask the mixer to emit channel values.
 
-        Some firmware/configs don't push channel values reliably unless requested.
-        This is a best-effort mechanism; even if the mixer ignores it, control still works.
+        This is a resync safety net, not the main path: the mixer pushes state
+        changes as they happen. CHANNEL_INFO_CONTROL type 6 makes it re-send the
+        entire value space (5257 values on a DL32S), so it recovers cleanly from a
+        missed update - but it is expensive, hence the slow interval. Values that
+        have not changed are filtered out before reaching listeners, so a resync
+        produces no entity churn.
         """
         try:
             while True:
+                await asyncio.sleep(RESYNC_INTERVAL_SECONDS)
                 try:
                     await client.send_request(
                         MackieCommand.CHANNEL_INFO_CONTROL,
@@ -130,7 +139,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     )
                 except Exception:
                     pass
-                await asyncio.sleep(10)
         except asyncio.CancelledError:
             return
 
@@ -142,7 +150,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         "channels": channels,
         "snapshot_recall_address": snapshot_recall_address,
         "snapshot_slots": min(snapshot_slots, 64),
-        "poll_task": hass.async_create_task(_poll_loop(), name="mackie_dl_poll"),
+        # MUST be a background task. hass.async_create_task() registers a task that
+        # HA waits for while finishing startup, and this loop never returns - which
+        # stalled bootstrap until it timed out ("Setup timed out for bootstrap
+        # waiting on mackie_dl_poll") and delayed every restart.
+        "poll_task": entry.async_create_background_task(
+            hass, _poll_loop(), name="mackie_dl_poll"
+        ),
     }
 
     entry.async_on_unload(entry.add_update_listener(_update_listener))
