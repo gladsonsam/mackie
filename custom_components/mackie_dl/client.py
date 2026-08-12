@@ -413,8 +413,15 @@ class MackieClient:
             return
         start_addr = struct.unpack_from(">I", body, 0)[0]
         count = (meta >> 16) & 0xFFFF
-        # Values follow from chunk 2
-        max_values = min(count, (len(body) // 4) - 2)
+        # Values follow from chunk 2.
+        #
+        # count==0 means "as many as fit". After init the DL32S pushes its whole
+        # value space as two CHANNEL_VALUES requests (3072 then 2185 values) whose
+        # meta word is 0x00000500 - type 5, count 0. Taking min(count, available)
+        # there discards every pushed value, which is why nothing ever populated.
+        # Small messages do set count, so honour it when present.
+        available = (len(body) // 4) - 2
+        max_values = min(count, available) if count else available
         for i in range(max_values):
             addr = int(start_addr + i)
             raw = struct.unpack_from(">I", body, (2 + i) * 4)[0]
@@ -748,7 +755,8 @@ class MackieClient:
         resp_meta = struct.unpack_from(">I", resp.body, 4)[0]
         resp_count = (resp_meta >> 16) & 0xFFFF
         available = max(0, (len(resp.body) // 4) - 2)
-        n = min(int(resp_count), int(available), c)
+        # As in _handle_channel_values: count==0 means "as many as fit", not "none".
+        n = min(int(resp_count), available, c) if resp_count else min(available, c)
         out: list[int] = []
         for i in range(n):
             out.append(struct.unpack_from(">I", resp.body, (2 + i) * 4)[0])
