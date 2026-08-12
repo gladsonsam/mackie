@@ -77,8 +77,6 @@ The protocol is undocumented, so support depends on what has been observed.
 | DL16S | Head and sends from [DigiMixer](https://github.com/jskeet/DemoCode/tree/main/DigiMixer), EQ block unconfirmed |
 | DL32R | Mute and fader only |
 
-Firmware updates can move things. If entities start reporting nonsense, re-run the
-verifier below.
 
 ## Tools
 
@@ -104,8 +102,7 @@ map, and how to extend it.
 
 ## Credits
 
-Protocol groundwork by [Jon Skeet's DigiMixer](https://github.com/jskeet/DemoCode/tree/main/DigiMixer),
-whose independently derived DL16S findings agree with everything observed here.
+Protocol groundwork by [Jon Skeet's DigiMixer](https://github.com/jskeet/DemoCode/tree/main/DigiMixer).
 
 ## License
 
