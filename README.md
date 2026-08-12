@@ -1,49 +1,56 @@
-# Mackie DL → Home Assistant
+# Mackie DL for Home Assistant
 
-Custom integration for **Mackie DL-series** mixers over TCP (**port 50001**).
+Local control of **Mackie DL-series** digital mixers (DL32S, DL16S, DL32R) over TCP,
+with no cloud and no Master Fader app running.
 
-The DL32S's whole input strip is mapped — gain, phantom, HPF, gate, comp, four EQ
-bands, eight aux sends and four FX sends, per channel — reachable through one
-generic service. Entities stay a small curated set: mute and LR level per channel,
-plus show-snapshot recall.
+The DL32S input strip is fully mapped: gain, phantom power, HPF, gate, compressor,
+four EQ bands, eight aux sends and four FX sends, on every channel.
 
 ## Install
 
-1. Copy [`custom_components/mackie_dl`](custom_components/mackie_dl) into your HA
-   config as `config/custom_components/mackie_dl`.
-2. Restart Home Assistant.
-3. **Settings → Devices & services → Add integration → Mackie DL (TCP)**.
+### HACS
 
-Pick **mixer model** (`dl32s`, `dl16s`, `dl32r`, or `auto`). The connection is
-tested during setup. `auto` resolves to the DL32S map — the only one verified
-against real hardware.
+Add this repository as a custom repository (category: Integration), install, then
+restart Home Assistant.
 
-## Features
+### Manual
 
-| Area | What |
+Copy `custom_components/mackie_dl` into your Home Assistant `config/custom_components/`
+directory and restart.
+
+Then go to **Settings > Devices & services > Add integration > Mackie DL (TCP)** and
+enter the mixer's IP address. Pick your model, or leave it on `auto`.
+
+## What you get
+
+**Entities**, one set per mixer:
+
+| Entity | Type |
 |---|---|
-| **Device** | One device per mixer; optional friendly device name. |
-| **Entities** | Per-channel **mute** (switch) and **LR level** (number, %). **Show snapshot** (select) recalls Master Fader snapshots. |
-| **Full parameter access** | `set_parameter` / `get_parameter` reach every mapped field by name, in natural units. |
-| **Integration menu** | **Configure**: snapshot list length, recall mode, device name. **Reconfigure**: host, port, channels, model, snapshots. |
+| Input *N* mute | switch |
+| Input *N* LR level | number (0-100%) |
+| Show snapshot | select |
 
-### Services
+**Actions**, for automations and scripts:
 
-| Service | Fields |
+| Action | Fields |
 |---|---|
-| `set_input_mute` | `channel`, `muted` |
-| `set_input_fader` | `channel`, `level` (0–100 %) |
-| `recall_snapshot` | `snapshot` |
-| `set_parameter` | `channel`, `field`, `value` |
-| `get_parameter` | `channel`, `field` → returns value, address, verified flag |
-| `raw_set_value` | `address`, `int_value` or `float_value` |
+| `mackie_dl.set_parameter` | `channel`, `field`, `value` |
+| `mackie_dl.get_parameter` | `channel`, `field` (returns the value) |
+| `mackie_dl.set_input_mute` | `channel`, `muted` |
+| `mackie_dl.set_input_fader` | `channel`, `level` (0-100%) |
+| `mackie_dl.recall_snapshot` | `snapshot` |
+| `mackie_dl.raw_set_value` | `address`, `int_value` or `float_value` |
+
+`set_parameter` is the general one. It reaches any mapped field by name, in natural
+units, without needing an entity per parameter:
 
 ```yaml
-# Set channel 4's preamp gain to 18 dB
+# Preamp gain on channel 4, in dB
 action: mackie_dl.set_parameter
 data: {channel: 4, field: gain, value: 18}
 
-# Pull channel 12's aux 3 send down
+# Aux 3 send on channel 12
 action: mackie_dl.set_parameter
 data: {channel: 12, field: aux3_level, value: -20}
 
@@ -52,49 +59,54 @@ action: mackie_dl.set_parameter
 data: {channel: 7, field: phantom, value: true}
 ```
 
-Field names live in [`addressmap.py`](custom_components/mackie_dl/addressmap.py);
-the full offset table is in [SPEC.md](custom_components/mackie_dl/SPEC.md).
+Field names are defined in [`addressmap.py`](custom_components/mackie_dl/addressmap.py).
+Common ones: `mute`, `fader`, `gain`, `trim`, `pan`, `polarity`, `phantom`, `hpf_on`,
+`hpf_freq`, `gate_on`, `comp_on`, `eq_on`, `eq1_gain` through `eq4_type`,
+`aux1_level` through `aux8_mute`, `fx1_level` through `fx4_mute`.
 
-**Snapshots:** leave **snapshot recall address** at **0** for the Master Fader wire
-sequence (cmd `0x07`). Non-zero uses a legacy `CHANNEL_VALUES` write for unusual
-setups.
+**Snapshots.** Leave the snapshot recall address at `0` to use the standard recall
+sequence. A non-zero value selects a legacy write path needed by some DL32R setups.
 
-## Protocol status
+## Model support
 
-The protocol is undocumented; this map came from observation, and agrees with
-[Jon Skeet's DigiMixer](https://github.com/jskeet/DemoCode/tree/main/DigiMixer)
-wherever the two overlap.
+The protocol is undocumented, so support depends on what has been observed.
 
-| Model | Coverage |
+| Model | Status |
 |---|---|
-| **DL32S** | Full input strip, **verified against hardware 2026-08-12** (stride 106, 8 aux sends) |
-| DL16S | Inherited from DigiMixer; head and sends safe, EQ packing unconfirmed |
-| DL32R | Inherited from DigiMixer; trust mute and fader only |
+| **DL32S** | Full input strip, verified against hardware |
+| DL16S | Head and sends from [DigiMixer](https://github.com/jskeet/DemoCode/tree/main/DigiMixer), EQ block unconfirmed |
+| DL32R | Mute and fader only |
 
-Two behaviours are worth knowing before touching the code:
+Firmware updates can move things. If entities start reporting nonsense, re-run the
+verifier below.
 
-- **The mixer pushes, it does not serve.** Read requests come back empty; the whole
-  value space arrives unprompted after init.
-- **Bulk pushes carry `count = 0`**, meaning "as many as fit". Reading that as
-  "none" discards every value and leaves entities with no state.
+## Tools
 
-Both are explained in [SPEC.md](custom_components/mackie_dl/SPEC.md).
+`tools/discover/` contains read-only utilities for working on the protocol:
 
-## Tooling
-
-[`tools/discover/`](tools/discover) — all read-only:
-
-| Tool | Use |
+| Tool | Purpose |
 |---|---|
-| `listen_mackie.py` | Dump the pushed value space; `--watch` logs live changes as you move a control |
-| `trace_mackie.py` | Print every protocol frame both ways |
-| `verify_map.py` | Check the address map against a dump — run after a firmware update |
+| `listen_mackie.py` | Dump the mixer's value space. `--watch` names the address behind a control you move |
+| `trace_mackie.py` | Print every protocol frame in both directions |
+| `verify_map.py` | Check the address map against a live dump |
 
 ```bash
 python3 tools/discover/listen_mackie.py <mixer-ip> --model dl32s > dump.tsv
 python3 tools/discover/verify_map.py dump.tsv --model dl32s
 ```
 
-Run them on the mixer's LAN, not over a VPN. Also in
-[`tools/`](tools): `mackie_cli.py` for ad-hoc commands and `parse_pcap_mackie.py`
-for offline captures.
+Run them on the same network as the mixer.
+
+## Documentation
+
+[SPEC.md](custom_components/mackie_dl/SPEC.md) covers the wire protocol, the address
+map, and how to extend it.
+
+## Credits
+
+Protocol groundwork by [Jon Skeet's DigiMixer](https://github.com/jskeet/DemoCode/tree/main/DigiMixer),
+whose independently derived DL16S findings agree with everything observed here.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

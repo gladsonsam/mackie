@@ -23,9 +23,9 @@ Two independent sources agree on the head of the strip:
 
 * ``DL16S``  - Jon Skeet's DigiMixer (``jskeet/DemoCode``), reverse-engineered
   independently of this project.
-* ``DL32S``  - verified here on 2026-08-12 against the mixer at church by reading
-  its whole 5257-address value space and checking every field for plausibility
-  (see ``tools/discover/``).
+* ``DL32S``  - verified here against real hardware by reading the whole
+  5257-address value space and checking every field for plausibility across all
+  32 channels (see ``tools/discover/``).
 
 The head of the strip (offsets 1-49) is **identical** between DL16S and DL32S.
 The DL32S's larger stride is entirely accounted for by two extra aux sends
