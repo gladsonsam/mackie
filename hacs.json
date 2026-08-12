@@ -1,0 +1,7 @@
+{
+  "name": "Mackie DL (TCP)",
+  "content_in_root": false,
+  "render_readme": true,
+  "homeassistant": "2023.7.0",
+  "zip_release": false
+}
