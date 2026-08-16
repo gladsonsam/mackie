@@ -29,7 +29,13 @@ enter the mixer's IP address. Pick your model, or leave it on `auto`.
 |---|---|
 | Input *N* mute | switch |
 | Input *N* LR level | number (0-100%) |
+| Mute group *N* | switch |
 | Show snapshot | select |
+
+Mute group switches and the snapshot selector are labelled with the **names set
+on the desk**, and follow renames live — including renames made from the iPad.
+The snapshot selector also follows recalls made elsewhere, so it shows what is
+actually loaded rather than only what Home Assistant last did.
 
 **Actions**, for automations and scripts:
 
@@ -40,6 +46,9 @@ enter the mixer's IP address. Pick your model, or leave it on `auto`.
 | `mackie_dl.set_input_mute` | `channel`, `muted` |
 | `mackie_dl.set_input_fader` | `channel`, `level` (0-100%) |
 | `mackie_dl.recall_snapshot` | `snapshot` |
+| `mackie_dl.set_mute_group` | `group` (1-6), `muted` |
+| `mackie_dl.save_snapshot` | `snapshot`, `name` |
+| `mackie_dl.refresh_snapshot_names` | none (returns the name list) |
 | `mackie_dl.raw_set_value` | `address`, `int_value` or `float_value` |
 
 `set_parameter` is the general one. It reaches any mapped field by name, in natural

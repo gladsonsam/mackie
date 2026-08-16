@@ -7,7 +7,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .client import MackieClient
+from .client import MUTE_GROUP_COUNT, MackieClient, mute_group_name_slot
 from .const import DOMAIN
 from .device import device_info
 
@@ -26,9 +26,12 @@ async def async_setup_entry(
     client: MackieClient = data["client"]
     channels: int = int(data["channels"])
 
-    entities = [
+    entities: list[SwitchEntity] = [
         MackieInputMuteSwitch(entry, client, _MuteDesc(ch)) for ch in range(1, channels + 1)
     ]
+    entities.extend(
+        MackieMuteGroupSwitch(entry, client, g) for g in range(1, MUTE_GROUP_COUNT + 1)
+    )
     async_add_entities(entities)
 
 
@@ -73,6 +76,69 @@ class MackieInputMuteSwitch(SwitchEntity):
 
     async def async_turn_off(self, **kwargs) -> None:
         await self._client.set_input_mute(self._desc.channel, False)
+        self._is_on = False
+        self.async_write_ha_state()
+
+
+class MackieMuteGroupSwitch(SwitchEntity):
+    """A mute group master.
+
+    State comes from three places: a bulk type-2 dump the mixer sends at connect,
+    pushes when another client (the iPad) changes a group, and our own writes.
+    The mixer does not echo our own writes back, so those are cached locally -
+    without that the switch would flip back on the next state read.
+    """
+
+    _attr_has_entity_name = True
+    _attr_icon = "mdi:volume-off"
+
+    def __init__(self, entry: ConfigEntry, client: MackieClient, group: int) -> None:
+        self._client = client
+        self._group = group
+        self._attr_device_info = device_info(entry)
+        self._attr_unique_id = f"{entry.entry_id}_mute_group_{group}"
+        self._attr_name = self._compose_name(client.get_mute_group_name(group))
+        self._is_on: bool | None = client.get_cached_mute_group(group)
+        self._unsub_state = None
+        self._unsub_name = None
+
+    def _compose_name(self, mixer_name: str | None) -> str:
+        # Keep the group number in the entity name: a desk can give two groups
+        # the same label, so the label alone is not unique.
+        return f"Mute group {self._group} ({mixer_name})" if mixer_name else f"Mute group {self._group}"
+
+    @property
+    def is_on(self) -> bool | None:
+        return self._is_on
+
+    async def async_added_to_hass(self) -> None:
+        def _on_state(raw: int) -> None:
+            self._is_on = bool(raw)
+            self.async_write_ha_state()
+
+        def _on_name(name: str) -> None:
+            self._attr_name = self._compose_name(name or None)
+            self.async_write_ha_state()
+
+        self._unsub_state = self._client.subscribe_mute_group(self._group, _on_state)
+        self._unsub_name = self._client.subscribe_name(
+            mute_group_name_slot(self._group), _on_name
+        )
+
+    async def async_will_remove_from_hass(self) -> None:
+        for unsub in (self._unsub_state, self._unsub_name):
+            if unsub:
+                unsub()
+        self._unsub_state = None
+        self._unsub_name = None
+
+    async def async_turn_on(self, **kwargs) -> None:
+        await self._client.set_mute_group(self._group, True)
+        self._is_on = True
+        self.async_write_ha_state()
+
+    async def async_turn_off(self, **kwargs) -> None:
+        await self._client.set_mute_group(self._group, False)
         self._is_on = False
         self.async_write_ha_state()
 

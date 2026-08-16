@@ -158,3 +158,58 @@ raw_set_value:
           step: 0.001
           mode: box
 
+
+set_mute_group:
+  name: Set mute group
+  description: >-
+    Mute or unmute a mute group master. Note the mixer does not report mute group
+    state at connect, so the matching switch reads unknown until the first change.
+  fields:
+    group:
+      name: Mute group
+      description: Mute group number (1-6).
+      required: true
+      example: 1
+      selector:
+        number:
+          min: 1
+          max: 6
+          mode: box
+    muted:
+      name: Muted
+      description: True to mute the group, false to unmute.
+      required: true
+      example: true
+      selector:
+        boolean:
+
+save_snapshot:
+  name: Save snapshot
+  description: >-
+    Save the mixer's current state into a snapshot slot under the given name.
+    This overwrites whatever is in that slot.
+  fields:
+    snapshot:
+      name: Snapshot
+      description: Snapshot slot number (1-based).
+      required: true
+      example: 1
+      selector:
+        number:
+          min: 1
+          max: 64
+          mode: box
+    name:
+      name: Name
+      description: Name to store for this snapshot (ASCII).
+      required: true
+      example: Front of house
+      selector:
+        text:
+
+refresh_snapshot_names:
+  name: Refresh snapshot names
+  description: >-
+    Re-download the show archive from the mixer and reload snapshot names.
+    Names update automatically while connected; this is for recovering after the
+    show was changed by something that did not announce it.

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import struct
+import time
+import zipfile
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import Callable, Dict, Optional
@@ -21,7 +24,14 @@ class MackieCommand(IntEnum):
     CHANNEL_INFO_CONTROL = 0x06
     # Master Fader snapshot/show recall (observed on wire; not in public DigiMixer enum).
     SHOW_SNAPSHOT = 0x07
+    # File transfer, used to fetch Show.zip (which is where snapshot names live).
+    # See tools/capture/FINDINGS.md section 3.
+    FILE_INFO = 0x09
+    FILE_OPEN = 0x0A
+    FILE_CLOSE = 0x0B
+    FILE_READ = 0x0C
     GENERAL_INFO = 0x0E
+    SHOW_STATUS = 0x12
     CHANNEL_VALUES = 0x13
     BROADCAST_CONTROL = 0x15
     METER_LAYOUT = 0x16
@@ -29,6 +39,45 @@ class MackieCommand(IntEnum):
 
 
 HEADER0 = 0xAB
+
+#: The `type` byte in a CHANNEL_VALUES meta word selects the address space, it is
+#: not a data-type tag. Address 11 is input 1's `main_assign` under type 5 and
+#: mute group 1's master under type 2, so the two must never share a cache.
+VALUE_TYPE_PARAM = 5
+VALUE_TYPE_MUTE_GROUP = 2
+
+MUTE_GROUP_COUNT = 6
+#: Mute group N master mute. Verified for all six on a DL32S.
+MUTE_GROUP_BASE_ADDRESS = 10
+#: Mute group N name, in the flat CHANNEL_NAMES table (channels 1-32, aux 50-57,
+#: subgroups 58-63, mute groups 64-69, VCAs 70-75).
+MUTE_GROUP_NAME_SLOT_BASE = 63
+
+
+def mute_group_master_address(group_1_based: int) -> int:
+    if not 1 <= group_1_based <= MUTE_GROUP_COUNT:
+        raise ValueError(f"mute group must be 1..{MUTE_GROUP_COUNT}")
+    return MUTE_GROUP_BASE_ADDRESS + int(group_1_based)
+
+
+def mute_group_name_slot(group_1_based: int) -> int:
+    if not 1 <= group_1_based <= MUTE_GROUP_COUNT:
+        raise ValueError(f"mute group must be 1..{MUTE_GROUP_COUNT}")
+    return MUTE_GROUP_NAME_SLOT_BASE + int(group_1_based)
+
+
+def word_swap(data: bytes) -> bytes:
+    """Reverse the bytes within each 4-byte word.
+
+    Mackie stores text as little-endian characters inside an otherwise big-endian
+    protocol, so "MGZU" travels as 55 5a 47 4d. Applies to channel names, snapshot
+    names and file-transfer payloads alike. Trailing bytes past the last whole
+    word are dropped, which is correct: the protocol always pads to a word.
+    """
+    out = bytearray()
+    for i in range(0, len(data) - len(data) % 4, 4):
+        out += data[i : i + 4][::-1]
+    return bytes(out)
 
 
 @dataclass(frozen=True)
@@ -260,9 +309,29 @@ class MackieClient:
 
         self._pending: Dict[int, asyncio.Future[MackieMessage]] = {}
         self._lock = asyncio.Lock()
-        self._values: Dict[int, int] = {}  # raw u32 values by address
+        self._values: Dict[int, int] = {}  # raw u32 values by address (type 5)
         self._listeners: Dict[int, set[Callable[[int], None]]] = {}
         self._global_listeners: set[Callable[[int, int], None]] = set()
+
+        # Type-2 space. Roughly 107 addresses, of which 11-16 are the mute group
+        # masters; the rest is unmapped and includes floats. Kept separate from
+        # _values because the two spaces reuse the same low addresses - address 11
+        # is input 1's main_assign under type 5. See VALUE_TYPE_MUTE_GROUP.
+        self._type2_values: Dict[int, int] = {}
+        self._type2_listeners: Dict[int, set[Callable[[int], None]]] = {}
+
+        # CHANNEL_NAMES table, slot -> name. Pushed by the mixer at connect and
+        # again, one slot at a time, whenever anyone renames something.
+        self._names: Dict[int, str] = {}
+        self._name_listeners: Dict[int, set[Callable[[str], None]]] = {}
+
+        # Snapshot index -> name. Seeded from Show.zip, kept current by 0x07 op 5
+        # pushes from the mixer.
+        self._snapshot_names: Dict[int, str] = {}
+        self._snapshot_name_listeners: set[Callable[[], None]] = set()
+        #: Last snapshot recalled, learned from 0x07 op 1 relays. Unknown until
+        #: something recalls one; the mixer does not report it at connect.
+        self._current_snapshot: int | None = None
 
     async def connect(self) -> None:
         if self._rx_task:
@@ -393,7 +462,18 @@ class MackieClient:
             return
 
         if msg.command == MackieCommand.CHANNEL_NAMES:
+            # The mixer pushes the whole table at connect and one slot per
+            # rename thereafter. Previously this reply discarded the body, which
+            # is why names were never available.
+            self._handle_channel_names(msg)
             await self._send_response(seq=msg.seq, command=msg.command, body=b"")
+            return
+
+        if msg.command == MackieCommand.SHOW_SNAPSHOT:
+            self._handle_snapshot_push(msg)
+            await self._send_response(
+                seq=msg.seq, command=msg.command, body=msg.body[:4] if msg.body else b""
+            )
             return
 
         # Default: empty response
@@ -403,13 +483,72 @@ class MackieClient:
         if msg.command == MackieCommand.CHANNEL_VALUES:
             self._handle_channel_values(msg)
 
+    def _handle_snapshot_push(self, msg: MackieMessage) -> None:
+        """Learn snapshot names from op-5 (save) frames the mixer relays.
+
+        Body: <op=5> <snapshot number> <unix epoch> <word-swapped name>. The
+        mixer relays these to every *other* connected client, so renaming a
+        snapshot on the iPad updates us without any polling or file transfer.
+        """
+        body = msg.body
+        if len(body) < 8:
+            return
+        op, number = struct.unpack_from(">II", body, 0)
+        if number < 1:
+            return
+        # op 1 is a recall. The mixer relays these too, so recalling on the iPad
+        # tells us which snapshot is now active.
+        if op == 1:
+            if self._current_snapshot != int(number):
+                self._current_snapshot = int(number)
+                self._notify_snapshot_names()
+            return
+        if op != 5 or len(body) < 12:
+            return
+        name = word_swap(body[12:]).split(b"\x00")[0]
+        try:
+            text = name.decode("ascii").strip()
+        except UnicodeDecodeError:
+            return
+        if not text or self._snapshot_names.get(int(number)) == text:
+            return
+        self._snapshot_names[int(number)] = text
+        self._notify_snapshot_names()
+
+    def _notify_snapshot_names(self) -> None:
+        for cb in list(self._snapshot_name_listeners):
+            try:
+                cb()
+            except Exception:
+                pass
+
+    @property
+    def snapshot_names(self) -> Dict[int, str]:
+        return dict(self._snapshot_names)
+
+    @property
+    def current_snapshot(self) -> int | None:
+        return self._current_snapshot
+
+    def subscribe_snapshot_names(self, callback: Callable[[], None]) -> Callable[[], None]:
+        self._snapshot_name_listeners.add(callback)
+
+        def _unsub() -> None:
+            self._snapshot_name_listeners.discard(callback)
+
+        return _unsub
+
     def _handle_channel_values(self, msg: MackieMessage) -> None:
         body = msg.body
         if len(body) < 8:
             return
         meta = struct.unpack_from(">I", body, 4)[0]
-        # Only handle type=5 (normal values)
-        if (meta & 0xFF00) != 0x0500:
+        value_type = (meta >> 8) & 0xFF
+        if value_type == VALUE_TYPE_MUTE_GROUP:
+            self._handle_type2_values(body, meta)
+            return
+        # Only handle type=5 (normal values); type 1 is meters, which we ignore.
+        if value_type != VALUE_TYPE_PARAM:
             return
         start_addr = struct.unpack_from(">I", body, 0)[0]
         count = (meta >> 16) & 0xFFFF
@@ -440,6 +579,116 @@ class MackieClient:
                 except Exception:
                     # Listener exceptions should never kill RX loop.
                     pass
+
+    # --- mute group masters (type-2 space) ----------------------------------
+
+    def _handle_type2_values(self, body: bytes, meta: int) -> None:
+        """Cache the type-2 value space, which carries the mute group masters.
+
+        Two ways this arrives: a bulk dump at connect (start 1, count 0, ~107
+        values) that seeds initial state, and single-address pushes when another
+        client changes something. The mixer never echoes our own writes back, so
+        those are cached locally by `set_mute_group`.
+
+        As with type 5, count == 0 means "as many as fit", not "none".
+        """
+        start_addr = struct.unpack_from(">I", body, 0)[0]
+        count = (meta >> 16) & 0xFFFF
+        available = (len(body) // 4) - 2
+        n = min(count, available) if count else available
+        for i in range(n):
+            addr = int(start_addr + i)
+            raw = struct.unpack_from(">I", body, (2 + i) * 4)[0]
+            if self._type2_values.get(addr) == raw:
+                continue
+            self._type2_values[addr] = raw
+            for cb in self._type2_listeners.get(addr, set()):
+                try:
+                    cb(raw)
+                except Exception:
+                    pass
+
+    async def set_mute_group(self, group_1_based: int, muted: bool) -> None:
+        """Mute or unmute a mute group master."""
+        address = mute_group_master_address(group_1_based)
+        body = _build_channel_values_set(
+            address=address,
+            value_int=1 if muted else 0,
+            value_type=VALUE_TYPE_MUTE_GROUP,
+        )
+        await self.send_request(MackieCommand.CHANNEL_VALUES, body)
+        # No echo comes back for our own write, so cache it ourselves.
+        self._type2_values[address] = 1 if muted else 0
+
+    def get_cached_mute_group(self, group_1_based: int) -> bool | None:
+        raw = self._type2_values.get(mute_group_master_address(group_1_based))
+        return None if raw is None else bool(raw)
+
+    def subscribe_mute_group(
+        self, group_1_based: int, callback: Callable[[int], None]
+    ) -> Callable[[], None]:
+        addr = mute_group_master_address(group_1_based)
+        self._type2_listeners.setdefault(addr, set()).add(callback)
+
+        def _unsub() -> None:
+            listeners = self._type2_listeners.get(addr)
+            if not listeners:
+                return
+            listeners.discard(callback)
+            if not listeners:
+                self._type2_listeners.pop(addr, None)
+
+        return _unsub
+
+    # --- channel / mute group / VCA names -----------------------------------
+
+    def _handle_channel_names(self, msg: MackieMessage) -> None:
+        """Parse a CHANNEL_NAMES table into the name cache.
+
+        Body mirrors CHANNEL_VALUES: chunk 0 is the start slot, chunk 1 is
+        count/type, and the rest is a word-swapped stream of NUL-terminated
+        names. An unnamed slot is a bare NUL and still consumes an index, so
+        blanks must be kept while numbering or every later slot shifts.
+        """
+        body = msg.body
+        if len(body) < 8:
+            return
+        start = struct.unpack_from(">I", body, 0)[0]
+        raw = word_swap(body[8:])
+        for i, chunk in enumerate(raw.split(b"\x00")):
+            slot = int(start + i)
+            try:
+                name = chunk.decode("ascii").strip()
+            except UnicodeDecodeError:
+                continue
+            if self._names.get(slot) == name:
+                continue
+            self._names[slot] = name
+            for cb in self._name_listeners.get(slot, set()):
+                try:
+                    cb(name)
+                except Exception:
+                    pass
+
+    def get_name(self, slot: int) -> str | None:
+        return self._names.get(int(slot)) or None
+
+    def get_mute_group_name(self, group_1_based: int) -> str | None:
+        return self.get_name(mute_group_name_slot(group_1_based))
+
+    def subscribe_name(self, slot: int, callback: Callable[[str], None]) -> Callable[[], None]:
+        s = int(slot)
+        self._name_listeners.setdefault(s, set()).add(callback)
+
+        def _unsub() -> None:
+            listeners = self._name_listeners.get(s)
+            if not listeners:
+                return
+            listeners.discard(callback)
+            if not listeners:
+                self._name_listeners.pop(s, None)
+
+        return _unsub
 
     def subscribe_value(self, address: int, callback: Callable[[int], None]) -> Callable[[], None]:
         """Subscribe to raw u32 updates for a specific address. Returns an unsubscribe callable."""
@@ -766,6 +1015,83 @@ class MackieClient:
         values = await self.request_values(address, 1, timeout=timeout)
         return values[0] if values else None
 
+    # --- show archive download ----------------------------------------------
+    #
+    # Snapshot names are not in the value space or the name table. Master Fader
+    # downloads Show.zip from the mixer and reads them out of Show.dat. This is
+    # only needed to seed the list: once connected, renames arrive as 0x07 op 5
+    # pushes. See tools/capture/FINDINGS.md section 3.
+
+    #: Chunk size Master Fader uses. The mixer will not return an unbounded read.
+    _FILE_CHUNK = 0x2FEC
+
+    async def download_file(self, filename: str, timeout: float = 10.0) -> bytes:
+        """Download a file from the mixer over the 0x0A/0x09/0x0C/0x0B sequence."""
+        name = filename.encode("ascii")
+        padded = name + b"\x00" * ((-len(name)) % 4)
+        # Chunk 0 is a flag word; the rest is the word-swapped filename.
+        open_body = struct.pack(">I", 0x80000004) + word_swap(padded)
+        await self.send_request(MackieCommand.FILE_OPEN, open_body, timeout=timeout)
+
+        try:
+            info = await self.send_request(
+                MackieCommand.FILE_INFO, struct.pack(">II", 2, 0), timeout=timeout
+            )
+            if len(info.body) < 12:
+                raise MackieProtocolError("File info response too short")
+            size = struct.unpack_from(">I", info.body, 8)[0]
+            if size == 0:
+                return b""
+
+            out = bytearray()
+            while len(out) < size:
+                length = min(self._FILE_CHUNK, size - len(out))
+                req = struct.pack(">IIII", 0, size, len(out), length)
+                resp = await self.send_request(
+                    MackieCommand.FILE_READ, req, timeout=timeout
+                )
+                # Reply echoes the 16-byte request header, then the payload.
+                if len(resp.body) <= 16:
+                    raise MackieProtocolError("File read returned no data")
+                chunk = word_swap(resp.body[16:])[:length]
+                if not chunk:
+                    raise MackieProtocolError("File read returned an empty chunk")
+                out.extend(chunk)
+            return bytes(out[:size])
+        finally:
+            try:
+                await self.send_request(
+                    MackieCommand.FILE_CLOSE, struct.pack(">I", 0), timeout=timeout
+                )
+            except Exception:
+                pass
+
+    async def refresh_snapshot_names(self, timeout: float = 10.0) -> Dict[int, str]:
+        """Download Show.zip and load snapshot names from it.
+
+        Returns the index -> name mapping, and leaves it in the client's cache
+        where the select entity reads it.
+        """
+        archive = await self.download_file("Show.zip", timeout=timeout)
+        names = parse_show_archive(archive)
+        if names:
+            self._snapshot_names = dict(names)
+            self._notify_snapshot_names()
+        return dict(self._snapshot_names)
+
+    async def save_snapshot(self, snapshot_number_1_based: int, name: str) -> None:
+        """Save the current state to a snapshot slot under `name` (0x07 op 5)."""
+        snap = int(snapshot_number_1_based)
+        if snap < 1:
+            raise ValueError("snapshot_number must be >= 1")
+        text = str(name).encode("ascii", "replace")[:63]
+        padded = text + b"\x00" * (4 - len(text) % 4 if len(text) % 4 else 4)
+        epoch = int(time.time())
+        body = struct.pack(">III", 5, snap, epoch) + word_swap(padded)
+        await self.send_request(MackieCommand.SHOW_SNAPSHOT, body)
+        self._snapshot_names[snap] = str(name).strip()
+        self._notify_snapshot_names()
+
     async def recall_snapshot(self, address: int, snapshot_number_1_based: int) -> None:
         """
         Recall a show snapshot.
@@ -782,12 +1108,52 @@ class MackieClient:
         await self.recall_snapshot_master_fader(snap)
 
 
+#: Snapshot records inside Show.dat: fixed 72-byte records starting at 0x01a8,
+#: name at +0, snapshot index (u32 **little-endian**) at +64, hash at +68. Record
+#: order is display order, not index order.
+_SHOW_DAT_RECORDS_OFFSET = 0x01A8
+_SHOW_DAT_RECORD_STRIDE = 72
+_SHOW_DAT_INDEX_OFFSET = 64
+
+
+def parse_show_archive(archive: bytes) -> Dict[int, str]:
+    """Extract {snapshot index: name} from a downloaded Show.zip.
+
+    Inside the archive everything is plain ASCII - the word swap is a transport
+    encoding only, already undone by the time the bytes get here.
+    """
+    if not archive[:4] == b"PK\x03\x04":
+        return {}
+    try:
+        with zipfile.ZipFile(io.BytesIO(archive)) as zf:
+            show = zf.read("Show.dat")
+    except (zipfile.BadZipFile, KeyError):
+        return {}
+
+    names: Dict[int, str] = {}
+    offset = _SHOW_DAT_RECORDS_OFFSET
+    while offset + _SHOW_DAT_RECORD_STRIDE <= len(show):
+        record = show[offset : offset + _SHOW_DAT_RECORD_STRIDE]
+        index = struct.unpack_from("<I", record, _SHOW_DAT_INDEX_OFFSET)[0]
+        try:
+            name = record.split(b"\x00")[0].decode("ascii").strip()
+        except UnicodeDecodeError:
+            name = ""
+        # Empty-named records are real slots the desk has never used; skip them
+        # rather than offering a blank option.
+        if index and name:
+            names[int(index)] = name
+        offset += _SHOW_DAT_RECORD_STRIDE
+    return names
+
+
 def _build_channel_values_set(
     *,
     address: int,
     value_int: int | None = None,
     value_float: float | None = None,
     value_raw_u32: int | None = None,
+    value_type: int = VALUE_TYPE_PARAM,
 ) -> bytes:
     """
     Build a 'channel values' message body that sets a single address.
@@ -804,9 +1170,8 @@ def _build_channel_values_set(
 
     start = address & 0xFFFFFFFF
     count = 1
-    type_ = 5
     unknown = 0
-    meta = ((count & 0xFFFF) << 16) | ((type_ & 0xFF) << 8) | (unknown & 0xFF)
+    meta = ((count & 0xFFFF) << 16) | ((int(value_type) & 0xFF) << 8) | (unknown & 0xFF)
 
     out = bytearray()
     out.extend(struct.pack(">I", start))
