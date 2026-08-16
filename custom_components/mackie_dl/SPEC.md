@@ -68,20 +68,78 @@ Both `_handle_channel_values` and `request_values` need this rule.
 
 ```
 Chunk 0: start address
-Chunk 1: count (u16) | type (u8) | unknown (u8)      type 5 = values, 1 = meters
+Chunk 1: count (u16) | type (u8) | unknown (u8)      type 5 = values, 1 = meters, 2 = mute groups
 Chunk 2+: one value per chunk
 ```
 
 Levels are IEEE-754 floats in dB. Switches and enums are plain `u32`.
 
-## Snapshot recall
+### Type selects the address space
 
-Selected by the **snapshot recall address** option:
+`type` is not a data-type tag, it picks which space the address is in. Address 11
+is input 1's `main_assign` under type 5 and mute group 1's master under type 2.
+Caching both in one dict silently corrupts each other, so `client.py` keeps
+`_values` (type 5) and `_type2_values` separate.
 
-- **0 (default)**: request `0x07`, body two `u32`: `1`, then the 1-based snapshot
-  number. The mixer answers `0x07` with `1`.
-- **Non-zero**: a single `CHANNEL_VALUES` integer write to that address. Legacy path
-  for some DL32R setups.
+Type 2 holds about 107 addresses, pushed in bulk at connect with `count = 0`.
+Only 11-16 are identified: **mute group N master = address 10 + N**, 1 = muted.
+
+## Text is word-swapped
+
+Every string on the wire — channel names, snapshot names, filenames, file
+payloads — is stored as 4-byte words with the bytes reversed inside each word:
+little-endian characters in a big-endian protocol. `MGZU` travels as
+`55 5a 47 4d`. `word_swap()` undoes it.
+
+Inside a downloaded archive the contents are plain ASCII; the swap is a transport
+encoding only.
+
+## Snapshots
+
+`SHOW_SNAPSHOT` (0x07) is multi-op, selected by the first body word.
+
+- **op 1 — recall.** `00000001 <number>`. The mixer answers `1`.
+  (The **snapshot recall address** option can instead select a legacy single
+  `CHANNEL_VALUES` write, needed by some DL32R setups. Leave it at 0 otherwise.)
+- **op 5 — save with name.** `00000005 <number> <unix epoch> <word-swapped name>`.
+
+The mixer relays both to every *other* connected client as a Request, which is
+how a second client learns that a snapshot was recalled or renamed. It does not
+echo back to the client that made the change, so a client must cache its own
+writes.
+
+### Snapshot names live in a show archive
+
+Names are in neither the value space nor the name table. The client downloads
+`Show.zip` from the mixer:
+
+| Command | Role |
+|---|---|
+| `0x0A` | open file — flag word + word-swapped filename |
+| `0x09` op2 | file size |
+| `0x0C` | read chunk — `<flags><size><offset><length>`, reply echoes 16 bytes then data |
+| `0x0B` | close |
+
+`Show.dat` inside it holds 72-byte snapshot records from `0x01a8`: name at +0,
+index as u32 **little-endian** at +64. Record order is display order, not index
+order.
+
+This download only seeds the list; op-5 pushes keep it current afterwards.
+
+## Names
+
+`CHANNEL_NAMES` (0x18) is one flat table, pushed at connect and written one slot
+at a time on rename. Body layout matches `CHANNEL_VALUES`; the payload is a
+word-swapped stream of NUL-terminated names. **An unnamed slot is a bare NUL and
+still consumes an index**, so blanks must be kept while numbering.
+
+| Slots | Contents |
+|---|---|
+| 1-32 | input channels |
+| 50-57 | 8 aux outputs |
+| 58-63 | 6 subgroups |
+| 64-69 | 6 mute groups (group N = slot 63 + N) |
+| 70-75 | 6 VCAs |
 
 ## Address space
 

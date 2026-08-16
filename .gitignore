@@ -20,3 +20,8 @@ venv/
 # OS junk
 .DS_Store
 Thumbs.db
+
+# Wire captures and the show archive pulled off the mixer. Local evidence for
+# tools/capture/FINDINGS.md - kept out of git: multi-MB binaries that contain the
+# desk's channel names and show data, and this repo is public.
+captures/

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import struct
 
 from homeassistant.config_entries import ConfigEntry
@@ -25,11 +26,16 @@ from .const import (
     MAX_INPUT_CHANNELS,
     SERVICE_GET_PARAMETER,
     SERVICE_RECALL_SNAPSHOT,
+    SERVICE_REFRESH_SNAPSHOT_NAMES,
     SERVICE_RAW_SET_VALUE,
+    SERVICE_SAVE_SNAPSHOT,
     SERVICE_SET_INPUT_FADER,
     SERVICE_SET_INPUT_MUTE,
+    SERVICE_SET_MUTE_GROUP,
     SERVICE_SET_PARAMETER,
 )
+
+_LOGGER = logging.getLogger(__name__)
 
 PLATFORMS: list[str] = ["switch", "number", "select"]
 
@@ -118,6 +124,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     )
     await client.connect()
 
+    # Seed snapshot names from the mixer's show archive. Renames after this
+    # arrive as pushes, so this download happens once per connection. Failure is
+    # not fatal: the select entity falls back to bare slot numbers.
+    try:
+        await client.refresh_snapshot_names()
+    except Exception as err:
+        _LOGGER.warning("Could not read snapshot names from %s: %s", host, err)
+
     async def _poll_loop() -> None:
         """Periodically re-ask the mixer to emit channel values.
 
@@ -179,6 +193,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         snap = int(call.data["snapshot"])
         addr = int(hass.data[DOMAIN][entry.entry_id]["snapshot_recall_address"])
         await client.recall_snapshot(addr, snap)
+
+    async def handle_set_mute_group(call):
+        group = int(call.data["group"])
+        await client.set_mute_group(group, _as_bool(call.data["muted"]))
+
+    async def handle_save_snapshot(call):
+        snap = int(call.data["snapshot"])
+        await client.save_snapshot(snap, str(call.data["name"]))
+
+    async def handle_refresh_snapshot_names(call) -> ServiceResponse:
+        names = await client.refresh_snapshot_names()
+        return {"snapshots": {str(k): v for k, v in sorted(names.items())}}
 
     async def handle_raw_set_value(call):
         addr = int(call.data["address"])
@@ -259,6 +285,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass.services.async_register(DOMAIN, SERVICE_RECALL_SNAPSHOT, handle_recall_snapshot)
     if not hass.services.has_service(DOMAIN, SERVICE_RAW_SET_VALUE):
         hass.services.async_register(DOMAIN, SERVICE_RAW_SET_VALUE, handle_raw_set_value)
+    if not hass.services.has_service(DOMAIN, SERVICE_SET_MUTE_GROUP):
+        hass.services.async_register(DOMAIN, SERVICE_SET_MUTE_GROUP, handle_set_mute_group)
+    if not hass.services.has_service(DOMAIN, SERVICE_SAVE_SNAPSHOT):
+        hass.services.async_register(DOMAIN, SERVICE_SAVE_SNAPSHOT, handle_save_snapshot)
+    if not hass.services.has_service(DOMAIN, SERVICE_REFRESH_SNAPSHOT_NAMES):
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_REFRESH_SNAPSHOT_NAMES,
+            handle_refresh_snapshot_names,
+            supports_response=SupportsResponse.ONLY,
+        )
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
