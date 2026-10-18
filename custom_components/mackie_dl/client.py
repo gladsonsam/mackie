@@ -21,6 +21,9 @@ class MackieCommand(IntEnum):
     KEEP_ALIVE = 0x01
     CLIENT_HANDSHAKE = 0x03
     FIRMWARE_INFO = 0x04
+    # Reboot into normal (1) or updater (2) mode: len-1 body holding the
+    # mode word, as used by the firmware-update flow.
+    REBOOT = 0x05
     CHANNEL_INFO_CONTROL = 0x06
     # Master Fader snapshot/show recall (observed on wire; not in public DigiMixer enum).
     SHOW_SNAPSHOT = 0x07
@@ -30,7 +33,14 @@ class MackieCommand(IntEnum):
     FILE_OPEN = 0x0A
     FILE_CLOSE = 0x0B
     FILE_READ = 0x0C
+    # File upload chunks (POST FILE): body [id, total, offset, chunklen,
+    # ...data], data words word-swapped like everything else.
+    POST_FILE = 0x0D
     GENERAL_INFO = 0x0E
+    # SET SYSTEM STATE family (0x0F), sub-selected by body word 0, mirroring
+    # the 0x0E GET family: 1 boot code, 3 device name, 6 static IP config,
+    # 0x12 network config. Determined by protocol analysis.
+    SET_SYSTEM_STATE = 0x0F
     SHOW_STATUS = 0x12
     CHANNEL_VALUES = 0x13
     BROADCAST_CONTROL = 0x15
@@ -45,6 +55,9 @@ HEADER0 = 0xAB
 #: mute group 1's master under type 2, so the two must never share a cache.
 VALUE_TYPE_PARAM = 5
 VALUE_TYPE_MUTE_GROUP = 2
+#: Meters ride CHANNEL_VALUES too (see the chunk-1 comment in SPEC.md, "Value
+#: messages": type 5 = values, 1 = meters, 2 = mute groups).
+VALUE_TYPE_METER = 1
 
 MUTE_GROUP_COUNT = 6
 #: Mute group N master mute. Verified for all six on a DL32S.
@@ -264,6 +277,38 @@ def _meter_layout_body(addresses: list[int]) -> bytes:
     return bytes(out)
 
 
+# Aux sends sit inside each input strip as (level, mute, pan) triples
+# starting at offset 50: aux N level at 50 + (N-1)*3, its mute one word later,
+# pan two words later. addressmap.py pins the layout (_input_block:
+# aux_first = 50, stride 3); only the count varies by model (DL32S stride 106
+# = 8 sends, DL16S 100 = 6, DL32R unmapped). Cross-checked against addressmap
+# in tests/test_protocol.py so these constants can never drift from the map.
+AUX_SEND_FIRST_OFFSET = 50
+AUX_SEND_STRIDE = 3
+
+# Subgroup master strips come from addressmap.py (DL32S blocks["subgroup"]):
+# six 51-word strips from 4041, master mute at offset 0, master fader at
+# offset 1 (mute-first layout cross-checked against parameter metadata; 4049 is COMP
+# ENABLE, not mute). Main-out: 87 words from 4347 (fader@0, mute@1, bal@2).
+# Aux masters: 8 x 90 words from 4434 (mute@3, fader@4). All verified=False
+# in the map - confirming them is a planned +/-1 dB nudge trial. The
+# constants here are cross-checked against the map in tests/test_protocol.py,
+# and writes are gated to mixer_model == "dl32s" only.
+_SUBGROUP_STRIP_BASE = 4041
+_SUBGROUP_STRIP_STRIDE = 51
+_SUBGROUP_COUNT = 6
+_SUBGROUP_FADER_OFFSET = 1
+_SUBGROUP_MUTE_OFFSET = 0
+_MAIN_FADER_ADDRESS = 4347
+_MAIN_MUTE_ADDRESS = 4348
+_MAIN_BAL_ADDRESS = 4349
+_AUXMASTER_BASE = 4434
+_AUXMASTER_STRIDE = 90
+_AUXMASTER_COUNT = 8
+_AUXMASTER_FADER_OFFSET = 4
+_AUXMASTER_MUTE_OFFSET = 3
+
+
 class MackieClient:
     """
     Minimal async client for Mackie DL-series TCP protocol (port 50001).
@@ -320,6 +365,13 @@ class MackieClient:
         self._type2_values: Dict[int, int] = {}
         self._type2_listeners: Dict[int, set[Callable[[int], None]]] = {}
 
+        # Type-1 meter space. Published as periodic CHANNEL_VALUES frames once
+        # METER_LAYOUT (0x16) + BROADCAST_CONTROL (0x15) have been sent (SPEC.md
+        # command table). Keep it out of _values and _type2_values the same way
+        # those two are kept apart: each space reuses low addresses freely.
+        self._meter_values: Dict[int, int] = {}
+        self._global_meter_listeners: set[Callable[[int, int], None]] = set()
+
         # CHANNEL_NAMES table, slot -> name. Pushed by the mixer at connect and
         # again, one slot at a time, whenever anyone renames something.
         self._names: Dict[int, str] = {}
@@ -333,37 +385,121 @@ class MackieClient:
         #: something recalls one; the mixer does not report it at connect.
         self._current_snapshot: int | None = None
 
+        # Connection state. The mixer power-cycles with the rack, so dropouts
+        # are routine: _rx_task dying means the transport is gone, and the
+        # integration reconnects from the poll loop instead of needing HA to
+        # reload the entry. Entity listeners are NEVER cleared on drop - only
+        # close() (integration unload) clears subscriptions.
+        self._connected = False
+        self._conn_listeners: set[Callable[[bool], None]] = set()
+
     async def connect(self) -> None:
-        if self._rx_task:
+        """Open the mixer connection (idempotent).
+
+        Safe to call again after a dropout: any dead transport is torn down
+        first, and entity subscriptions are left untouched so entities resume
+        without re-subscribing. Raises the underlying OSError if the mixer is
+        unreachable - callers that poll (ensure_connected) catch it.
+        """
+        if self._is_usable():
             return
+        await self._drop_transport()
         self._reader, self._writer = await asyncio.open_connection(self._host, self._port)
         self._rx_task = asyncio.create_task(self._rx_loop(), name="mackie_dl_rx")
         self._keepalive_task = asyncio.create_task(self._keepalive_loop(), name="mackie_dl_keepalive")
+        try:
+            await self._initialize_connection()
+        except Exception:
+            await self._drop_transport()
+            raise
+        self._set_connected(True)
 
-        await self._initialize_connection()
+    async def ensure_connected(self) -> bool:
+        """Connect if down, for poll loops. Never raises; True when usable."""
+        if self._is_usable():
+            return True
+        try:
+            await self.connect()
+        except Exception:
+            return False
+        return self._is_usable()
 
-    async def close(self) -> None:
-        if self._keepalive_task:
-            self._keepalive_task.cancel()
-            self._keepalive_task = None
-        if self._rx_task:
-            self._rx_task.cancel()
-            self._rx_task = None
-        if self._writer:
-            self._writer.close()
+    def _is_usable(self) -> bool:
+        rx = self._rx_task
+        return (
+            self._writer is not None
+            and rx is not None
+            and not rx.done()
+        )
+
+    @property
+    def is_connected(self) -> bool:
+        return self._connected
+
+    def subscribe_connection(self, callback: Callable[[bool], None]) -> Callable[[], None]:
+        """Called with True/False on connect/drop. Returns an unsubscribe callable."""
+        self._conn_listeners.add(callback)
+
+        def _unsub() -> None:
+            self._conn_listeners.discard(callback)
+
+        return _unsub
+
+    def _set_connected(self, value: bool) -> None:
+        if self._connected == value:
+            return
+        self._connected = value
+        for cb in list(self._conn_listeners):
             try:
-                await self._writer.wait_closed()
+                cb(value)
+            except Exception:
+                pass
+
+    def _note_transport_lost(self) -> None:
+        """Mark this transport dead. Called when the rx loop exits."""
+        self._rx_task = None
+        self._set_connected(False)
+
+    async def _drop_transport(self) -> None:
+        """Tear down tasks/transport WITHOUT clearing subscriptions.
+
+        Shared by close() and the reconnect path. Safe with nothing open.
+        Marks the connection down only if something was actually open, so a
+        no-op drop never flaps entity availability.
+        """
+        keepalive, rx, writer = self._keepalive_task, self._rx_task, self._writer
+        self._keepalive_task = None
+        self._rx_task = None
+        if keepalive:
+            keepalive.cancel()
+        if rx:
+            rx.cancel()
+        if writer:
+            writer.close()
+            try:
+                await writer.wait_closed()
             except Exception:
                 pass
         self._reader = None
         self._writer = None
+        if keepalive is not None or rx is not None or writer is not None:
+            self._set_connected(False)
 
         for fut in list(self._pending.values()):
             if not fut.done():
                 fut.cancel()
         self._pending.clear()
+
+    async def close(self) -> None:
+        await self._drop_transport()
+
         self._listeners.clear()
         self._global_listeners.clear()
+        self._global_meter_listeners.clear()
+        self._type2_listeners.clear()
+        self._name_listeners.clear()
+        self._snapshot_name_listeners.clear()
+        self._conn_listeners.clear()
 
     async def _keepalive_loop(self) -> None:
         # Per protocol notes: send every ~2.5 seconds.
@@ -389,7 +525,12 @@ class MackieClient:
                     fut = self._pending.pop(msg.seq, None)
                     if fut and not fut.done():
                         if msg.msg_type == MackieMessageType.ERROR:
-                            fut.set_exception(MackieProtocolError("Mixer returned ERROR response"))
+                            err = MackieProtocolError(
+                                f"Mixer returned ERROR response "
+                                f"(seq={msg.seq} cmd=0x{int(msg.command):02x} "
+                                f"body={msg.body.hex()})"
+                            )
+                            fut.set_exception(err)
                         else:
                             fut.set_result(msg)
         except asyncio.CancelledError:
@@ -400,6 +541,16 @@ class MackieClient:
                 if not fut.done():
                     fut.set_exception(e)
             self._pending.clear()
+        finally:
+            # The transport is gone (dropout, close, or failure): mark it so
+            # connect()/ensure_connected() will rebuild instead of no-op on a
+            # dead _rx_task, and tell entities they are stale. close() also
+            # clears _rx_task itself; this is idempotent with that.
+            # Guard: a superseded loop (reconnect already built a live one)
+            # must not clear the new task.
+            rx = self._rx_task
+            if rx is None or rx.done():
+                self._note_transport_lost()
 
     async def _read_exactly(self, n: int) -> bytes:
         assert self._reader is not None
@@ -547,7 +698,12 @@ class MackieClient:
         if value_type == VALUE_TYPE_MUTE_GROUP:
             self._handle_type2_values(body, meta)
             return
-        # Only handle type=5 (normal values); type 1 is meters, which we ignore.
+        if value_type == VALUE_TYPE_METER:
+            # Periodic meter reports (BROADCAST_CONTROL). Previously dropped
+            # on the floor, which made meter values unreachable for the CLI.
+            self._handle_meter_values(body, meta)
+            return
+        # Only handle type=5 (normal values); other spaces are routed above.
         if value_type != VALUE_TYPE_PARAM:
             return
         start_addr = struct.unpack_from(">I", body, 0)[0]
@@ -640,6 +796,58 @@ class MackieClient:
 
         return _unsub
 
+    # --- meters (type-1 space) ----------------------------------------------
+
+    def _handle_meter_values(self, body: bytes, meta: int) -> None:
+        """Cache a periodic meter report (CHANNEL_VALUES with meta type 1).
+
+        METER_LAYOUT (0x16) selects which addresses are reported and
+        BROADCAST_CONTROL (0x15) turns the timer on; SPEC.md documents both in
+        the command table. As with the other spaces, count == 0 means "as many
+        as fit" (SPEC.md, "Bulk pushes carry count = 0"), although periodic
+        reports are small enough to set count correctly.
+        """
+        start_addr = struct.unpack_from(">I", body, 0)[0]
+        count = (meta >> 16) & 0xFFFF
+        available = (len(body) // 4) - 2
+        n = min(count, available) if count else available
+        for i in range(n):
+            addr = int(start_addr + i)
+            raw = struct.unpack_from(">I", body, (2 + i) * 4)[0]
+            if self._meter_values.get(addr) == raw:
+                continue
+            self._meter_values[addr] = raw
+            for cb in list(self._global_meter_listeners):
+                try:
+                    cb(addr, raw)
+                except Exception:
+                    pass
+
+    def get_cached_meter_u32(self, address: int) -> int | None:
+        """Last meter raw u32 seen for an address, or None before the first report."""
+        return self._meter_values.get(int(address))
+
+    def subscribe_all_meters(self, callback: Callable[[int, int], None]) -> Callable[[], None]:
+        """Subscribe to every meter update. Callback receives (address, raw_u32).
+
+        Meter values are IEEE float dB on the wire, same encoding as faders.
+        Returns an unsubscribe callable, mirroring subscribe_all.
+        """
+        self._global_meter_listeners.add(callback)
+
+        def _unsub() -> None:
+            self._global_meter_listeners.discard(callback)
+
+        return _unsub
+
+    async def enable_meter_reports(self) -> None:
+        """Send METER_LAYOUT + BROADCAST_CONTROL so the mixer starts publishing meters.
+
+        connect() already sends both once (DigiMixer init order); re-sending is
+        harmless and lets a CLI session turn reports on explicitly.
+        """
+        await self._send_digimixer_meter_and_broadcast()
+
     # --- channel / mute group / VCA names -----------------------------------
 
     def _handle_channel_names(self, msg: MackieMessage) -> None:
@@ -690,6 +898,26 @@ class MackieClient:
 
         return _unsub
 
+    async def set_channel_name(self, slot: int, name: str) -> None:
+        """Rename one slot in the CHANNEL_NAMES table (0x18 single-slot write).
+
+        Slot numbering per SPEC.md "Names": 1-32 inputs, 50-57 aux outputs,
+        58-63 subgroups, 64-69 mute groups, 70-75 VCAs. The mixer does not echo
+        our own writes back (SPEC.md, "Snapshots", about relaying to other
+        clients), so cache the name locally like the mute/fader setters do.
+        """
+        s = int(slot)
+        if s < 1:
+            raise ValueError("slot must be >= 1")
+        body = _build_channel_name_write(slot=s, name=name)
+        await self.send_request(MackieCommand.CHANNEL_NAMES, body)
+        self._names[s] = str(name).strip()
+        for cb in self._name_listeners.get(s, set()):
+            try:
+                cb(self._names[s])
+            except Exception:
+                pass
+
     def subscribe_value(self, address: int, callback: Callable[[int], None]) -> Callable[[], None]:
         """Subscribe to raw u32 updates for a specific address. Returns an unsubscribe callable."""
         addr = int(address)
@@ -711,6 +939,21 @@ class MackieClient:
 
         def _unsub() -> None:
             self._global_listeners.discard(callback)
+
+        return _unsub
+
+    def subscribe_type2(self, address: int, callback: Callable[[int], None]) -> Callable[[], None]:
+        """Subscribe to raw u32 updates for a type-2 address. Returns an unsubscribe callable."""
+        addr = int(address)
+        self._type2_listeners.setdefault(addr, set()).add(callback)
+
+        def _unsub() -> None:
+            listeners = self._type2_listeners.get(addr)
+            if not listeners:
+                return
+            listeners.discard(callback)
+            if not listeners:
+                self._type2_listeners.pop(addr, None)
 
         return _unsub
 
@@ -930,6 +1173,10 @@ class MackieClient:
         await self.send_request(MackieCommand.CHANNEL_VALUES, body)
         self._cache_and_notify_u32(addr, 1 if muted else 0)
 
+    # NOTE: early subgroup helpers that stood here (class-level geometry
+    # constants without a model gate) were consolidated into the single
+    # gated subgroup block further down, where the map-pinned offsets live.
+
     async def set_input_fader(self, input_channel_1_based: int, level_0_to_1: float) -> None:
         await self.set_input_fader_level(input_channel_1_based, level_0_to_1)
 
@@ -969,6 +1216,189 @@ class MackieClient:
         raw = struct.unpack(">I", struct.pack(">f", float(db)))[0]
         self._cache_and_notify_u32(addr, raw)
 
+    # --- aux sends (per-input send block) ------------------------------------
+    #
+    # The send block is what the address map actually covers: each input strip
+    # carries aux1..auxN (level, mute, pan) triples at offset 50 (pan per
+    # parameter metadata; reads center). Aux master strips live in
+    # addressmap blocks["auxmaster" ].
+
+    def _aux_send_count(self) -> int:
+        """How many aux sends the active input map exposes.
+
+        Both mapped DL16S-family strides keep the send block at offset 50; only
+        the count differs with stride (DL32S 106 → 8, DL16S 100 → 6). DL32R has
+        no verified send block (addressmap DL32R: mute/fader only), so aux
+        sends are refused there rather than guessed.
+        """
+        if self._input_stride == 106:
+            return 8
+        if self._input_stride == 100:
+            return 6
+        raise ValueError("aux sends are only mapped for DL32S/DL16S input strips")
+
+    def _aux_send_address(self, input_channel_1_based: int, aux_send_1_based: int, is_mute: bool) -> int:
+        n = int(aux_send_1_based)
+        count = self._aux_send_count()
+        if not 1 <= n <= count:
+            raise ValueError(f"aux send must be 1..{count}")
+        offset = AUX_SEND_FIRST_OFFSET + (n - 1) * AUX_SEND_STRIDE + (1 if is_mute else 0)
+        return self._input_base_address(input_channel_1_based) + offset
+
+    def aux_send_mute_address(self, input_channel_1_based: int, aux_send_1_based: int) -> int:
+        """Address of an input's aux send mute (map field aux<m>_mute)."""
+        return self._aux_send_address(input_channel_1_based, aux_send_1_based, is_mute=True)
+
+    def aux_send_level_address(self, input_channel_1_based: int, aux_send_1_based: int) -> int:
+        """Address of an input's aux send level (map field aux<m>_level)."""
+        return self._aux_send_address(input_channel_1_based, aux_send_1_based, is_mute=False)
+
+    async def set_aux_mute(self, input_channel_1_based: int, aux_send_1_based: int, muted: bool) -> None:
+        """Mute or unmute an input's aux send (the aux mix page in Master Fader)."""
+        addr = self.aux_send_mute_address(input_channel_1_based, aux_send_1_based)
+        body = _build_channel_values_set(address=addr, value_int=1 if muted else 0)
+        await self.send_request(MackieCommand.CHANNEL_VALUES, body)
+        self._cache_and_notify_u32(addr, 1 if muted else 0)
+
+    async def set_aux_fader(self, input_channel_1_based: int, aux_send_1_based: int, level_0_to_1: float) -> None:
+        """Set an input's aux send level from a normalized 0..1 fader position."""
+        level = float(level_0_to_1)
+        if level < 0.0:
+            level = 0.0
+        if level > 1.0:
+            level = 1.0
+        await self.set_aux_fader_db(input_channel_1_based, aux_send_1_based, _level_to_db(level))
+
+    async def set_aux_fader_db(self, input_channel_1_based: int, aux_send_1_based: int, db: float) -> None:
+        """Set an input's aux send level in dB on the mixer's scale (-120..+10 typical)."""
+        addr = self.aux_send_level_address(input_channel_1_based, aux_send_1_based)
+        v = float(db)
+        lo, hi = _DB_POINTS[0], _DB_POINTS[-1]
+        if v <= lo:
+            v = lo
+        elif v >= hi:
+            v = hi
+        body = _build_channel_values_set(address=addr, value_float=v)
+        await self.send_request(MackieCommand.CHANNEL_VALUES, body)
+        raw = struct.unpack(">I", struct.pack(">f", float(v)))[0]
+        self._cache_and_notify_u32(addr, raw)
+
+    def aux_send_pan_address(self, input_channel_1_based: int, aux_send_1_based: int) -> int:
+        """Address of an aux send's pan (third word of the send triple)."""
+        return self._aux_send_address(input_channel_1_based, aux_send_1_based, is_mute=False) + 2
+
+    async def set_aux_pan(self, input_channel_1_based: int, aux_send_1_based: int, pan: float) -> None:
+        """Set an aux send pan, -1 (left) .. +1 (right), 0 = center."""
+        addr = self.aux_send_pan_address(input_channel_1_based, aux_send_1_based)
+        v = max(-1.0, min(1.0, float(pan)))
+        body = _build_channel_values_set(address=addr, value_float=v)
+        await self.send_request(MackieCommand.CHANNEL_VALUES, body)
+        self._cache_and_notify_u32(addr, struct.unpack(">I", struct.pack(">f", v))[0])
+
+    # --- subgroup masters ----------------------------------------------------
+
+    def _subgroup_address(self, subgroup_1_based: int, offset: int) -> int:
+        # Only the DL32S map carries a subgroup block (addressmap.py). For the
+        # other models the map must grow first, so refuse rather than guess.
+        if self._mixer_model != "dl32s":
+            raise ValueError("subgroup masters are only mapped for DL32S")
+        n = int(subgroup_1_based)
+        if not 1 <= n <= _SUBGROUP_COUNT:
+            raise ValueError(f"subgroup must be 1..{_SUBGROUP_COUNT}")
+        return _SUBGROUP_STRIP_BASE + (n - 1) * _SUBGROUP_STRIP_STRIDE + offset
+
+    def subgroup_mute_address(self, subgroup_1_based: int) -> int:
+        """Address of a subgroup master mute (map field subgroup.mute)."""
+        return self._subgroup_address(subgroup_1_based, _SUBGROUP_MUTE_OFFSET)
+
+    def subgroup_fader_address(self, subgroup_1_based: int) -> int:
+        """Address of a subgroup master fader (map field subgroup.fader)."""
+        return self._subgroup_address(subgroup_1_based, _SUBGROUP_FADER_OFFSET)
+
+    async def set_subgroup_mute(self, subgroup_1_based: int, muted: bool) -> None:
+        """Mute or unmute a subgroup master."""
+        addr = self.subgroup_mute_address(subgroup_1_based)
+        body = _build_channel_values_set(address=addr, value_int=1 if muted else 0)
+        await self.send_request(MackieCommand.CHANNEL_VALUES, body)
+        self._cache_and_notify_u32(addr, 1 if muted else 0)
+
+    async def set_subgroup_fader(self, subgroup_1_based: int, level_0_to_1: float) -> None:
+        """Set a subgroup master fader from a normalized 0..1 position."""
+        level = float(level_0_to_1)
+        if level < 0.0:
+            level = 0.0
+        if level > 1.0:
+            level = 1.0
+        await self.set_subgroup_fader_db(subgroup_1_based, _level_to_db(level))
+
+    async def set_subgroup_fader_db(self, subgroup_1_based: int, db: float) -> None:
+        """Set a subgroup master fader in dB on the mixer's scale (-120..+10 typical)."""
+        addr = self.subgroup_fader_address(subgroup_1_based)
+        v = float(db)
+        lo, hi = _DB_POINTS[0], _DB_POINTS[-1]
+        if v <= lo:
+            v = lo
+        elif v >= hi:
+            v = hi
+        body = _build_channel_values_set(address=addr, value_float=v)
+        await self.send_request(MackieCommand.CHANNEL_VALUES, body)
+        raw = struct.unpack(">I", struct.pack(">f", float(v)))[0]
+        self._cache_and_notify_u32(addr, raw)
+
+    # --- main / aux master strips (DL32S; see addressmap blocks) --------------
+
+    def _dl32s_only(self) -> None:
+        if self._mixer_model != "dl32s":
+            raise ValueError("master strips are only mapped for DL32S")
+
+    def main_fader_address(self) -> int:
+        return _MAIN_FADER_ADDRESS
+
+    def main_mute_address(self) -> int:
+        return _MAIN_MUTE_ADDRESS
+
+    def auxmaster_fader_address(self, aux_1_based: int) -> int:
+        n = int(aux_1_based)
+        if not 1 <= n <= _AUXMASTER_COUNT:
+            raise ValueError(f"aux master must be 1..{_AUXMASTER_COUNT}")
+        return _AUXMASTER_BASE + (n - 1) * _AUXMASTER_STRIDE + _AUXMASTER_FADER_OFFSET
+
+    def auxmaster_mute_address(self, aux_1_based: int) -> int:
+        n = int(aux_1_based)
+        if not 1 <= n <= _AUXMASTER_COUNT:
+            raise ValueError(f"aux master must be 1..{_AUXMASTER_COUNT}")
+        return _AUXMASTER_BASE + (n - 1) * _AUXMASTER_STRIDE + _AUXMASTER_MUTE_OFFSET
+
+    async def set_main_mute(self, muted: bool) -> None:
+        self._dl32s_only()
+        addr = self.main_mute_address()
+        body = _build_channel_values_set(address=addr, value_int=1 if muted else 0)
+        await self.send_request(MackieCommand.CHANNEL_VALUES, body)
+        self._cache_and_notify_u32(addr, 1 if muted else 0)
+
+    async def set_main_fader_db(self, db: float) -> None:
+        self._dl32s_only()
+        addr = self.main_fader_address()
+        v = max(_DB_POINTS[0], min(_DB_POINTS[-1], float(db)))
+        body = _build_channel_values_set(address=addr, value_float=v)
+        await self.send_request(MackieCommand.CHANNEL_VALUES, body)
+        self._cache_and_notify_u32(addr, struct.unpack(">I", struct.pack(">f", v))[0])
+
+    async def set_auxmaster_mute(self, aux_1_based: int, muted: bool) -> None:
+        self._dl32s_only()
+        addr = self.auxmaster_mute_address(aux_1_based)
+        body = _build_channel_values_set(address=addr, value_int=1 if muted else 0)
+        await self.send_request(MackieCommand.CHANNEL_VALUES, body)
+        self._cache_and_notify_u32(addr, 1 if muted else 0)
+
+    async def set_auxmaster_fader_db(self, aux_1_based: int, db: float) -> None:
+        self._dl32s_only()
+        addr = self.auxmaster_fader_address(aux_1_based)
+        v = max(_DB_POINTS[0], min(_DB_POINTS[-1], float(db)))
+        body = _build_channel_values_set(address=addr, value_float=v)
+        await self.send_request(MackieCommand.CHANNEL_VALUES, body)
+        self._cache_and_notify_u32(addr, struct.unpack(">I", struct.pack(">f", v))[0])
+
     async def raw_set_value_int(self, address: int, value: int) -> None:
         body = _build_channel_values_set(address=address, value_int=int(value))
         await self.send_request(MackieCommand.CHANNEL_VALUES, body)
@@ -978,6 +1408,25 @@ class MackieClient:
         body = _build_channel_values_set(address=address, value_float=float(value))
         await self.send_request(MackieCommand.CHANNEL_VALUES, body)
         self._cache_and_notify_u32(address, struct.unpack(">I", struct.pack(">f", float(value)))[0])
+
+    async def set_values(self, values: dict[int, int], value_type: int = 5) -> None:
+        """Write several addresses, one single-address message each.
+
+        Master Fader's own messages use (address, value) pairs with a 0x2000 count
+        flag, but a live DL32S parses that as start+count+values and the extra
+        words spill into neighbouring addresses (proven 2026-10-18: a 2-pair
+        write to 3310/4297 landed on 3310/3311/3312 instead). Singles coincide
+        under both interpretations, so fan out to singles. See SPEC.md.
+        """
+        for addr, raw in dict(values).items():
+            body = _build_channel_values_set(
+                address=int(addr), value_raw_u32=int(raw), value_type=int(value_type)
+            )
+            await self.send_request(MackieCommand.CHANNEL_VALUES, body)
+            if int(value_type) == 5:
+                self._cache_and_notify_u32(int(addr), int(raw))
+            else:
+                self._type2_values[int(addr)] = int(raw) & 0xFFFFFFFF
 
     async def request_values(self, start_address: int, count: int = 1, timeout: float = 3.0) -> list[int]:
         """
@@ -1066,6 +1515,87 @@ class MackieClient:
             except Exception:
                 pass
 
+    async def upload_file(
+        self, filename: str, data: bytes, file_type: int = 4, timeout: float = 10.0
+    ) -> None:
+        """Upload a file to the mixer (POST FILE sequence).
+
+        Determined by protocol analysis: FILE_OPEN (write) -> POST FILE
+        (0x0D) chunks -> zero-length
+        END chunk -> FILE_CLOSE. File bytes travel word-swapped, exactly like
+        downloads in the other direction.
+
+        ``file_type``rides in the open flags word: downloads use
+        ``0x80000000 | file_type``(observed 0x80000004 for Show.zip) while
+        uploads send the bare ``file_type``(RE: POST-machine open call passes
+        isWrite=0). Steps after the transfer (GET FILE INFO poll, SET FILE CRC,
+        PROCESS FILES) are separate methods so a live trial can confirm each.
+
+        EXPERIMENTAL: upload has not yet been exercised against hardware.
+        """
+        payload = bytes(data)
+        total = len(payload)
+        name = filename.encode("ascii")
+        padded_name = name + b"\x00" * ((-len(name)) % 4)
+        open_body = struct.pack(">I", int(file_type) & 0xFFFFFFFF) + word_swap(padded_name)
+        resp = await self.send_request(MackieCommand.FILE_OPEN, open_body, timeout=timeout)
+        if len(resp.body) < 8 or struct.unpack_from(">I", resp.body, 0)[0] == 0:
+            raise MackieProtocolError(f"File open for upload refused: {resp.body.hex()}")
+        file_id = struct.unpack_from(">I", resp.body, 4)[0]
+        try:
+            offset = 0
+            while offset < total:
+                length = min(self._FILE_CHUNK, total - offset)
+                chunk = word_swap(payload[offset : offset + length])
+                # Pad the tail word with zeros like the app does.
+                chunk = chunk + b"\x00" * ((-len(chunk)) % 4)
+                body = (
+                    struct.pack(">IIII", file_id, total, offset, length)
+                    + chunk
+                )
+                ack = await self.send_request(
+                    MackieCommand.POST_FILE, body, timeout=timeout
+                )
+                if len(ack.body) < 4 or struct.unpack_from(">I", ack.body, 0)[0] == 0:
+                    raise MackieProtocolError(
+                        f"POST chunk @{offset} not acknowledged: {ack.body.hex()}"
+                    )
+                offset += length
+            # Zero-length END chunk at offset == total.
+            end = await self.send_request(
+                MackieCommand.POST_FILE,
+                struct.pack(">IIII", file_id, total, total, 0),
+                timeout=timeout,
+            )
+            if len(end.body) < 4 or struct.unpack_from(">I", end.body, 0)[0] != 0:
+                raise MackieProtocolError(f"END of POST not accepted: {end.body.hex()}")
+        finally:
+            try:
+                await self.send_request(
+                    MackieCommand.FILE_CLOSE,
+                    struct.pack(">I", file_id),
+                    timeout=timeout,
+                )
+            except Exception:
+                pass
+
+    async def set_file_crc(self, address: int, crc32: int) -> None:
+        """Commit an uploaded file: the SET FILE CRC step (0x13 write).
+
+        From the close path: a CHANNEL_VALUES
+        write of body [address, 0x00010400, crc]. The address comes from the
+        transfer object's parameter; pass it explicitly until a live trial
+        pins down the show-push value.
+        """
+        body = struct.pack(">III", int(address) & 0xFFFFFFFF, 0x00010400, int(crc32) & 0xFFFFFFFF)
+        await self.send_request(MackieCommand.CHANNEL_VALUES, body)
+
+    async def process_files(self, timeout: float = 10.0) -> None:
+        """Ask the mixer to process uploaded files (op 10 on command 0x06)."""
+        await self.send_request(
+            MackieCommand.CHANNEL_INFO_CONTROL, struct.pack(">I", 10), timeout=timeout
+        )
+
     async def refresh_snapshot_names(self, timeout: float = 10.0) -> Dict[int, str]:
         """Download Show.zip and load snapshot names from it.
 
@@ -1084,10 +1614,10 @@ class MackieClient:
         snap = int(snapshot_number_1_based)
         if snap < 1:
             raise ValueError("snapshot_number must be >= 1")
-        text = str(name).encode("ascii", "replace")[:63]
-        padded = text + b"\x00" * (4 - len(text) % 4 if len(text) % 4 else 4)
         epoch = int(time.time())
-        body = struct.pack(">III", 5, snap, epoch) + word_swap(padded)
+        # Same name encoding as the CHANNEL_NAMES write (NUL-terminated,
+        # word-padded, word-swapped); _pack_channel_name keeps the two in step.
+        body = struct.pack(">III", 5, snap, epoch) + _pack_channel_name(name)
         await self.send_request(MackieCommand.SHOW_SNAPSHOT, body)
         self._snapshot_names[snap] = str(name).strip()
         self._notify_snapshot_names()
@@ -1106,6 +1636,225 @@ class MackieClient:
             await self.raw_set_value_int(address, snap)
             return
         await self.recall_snapshot_master_fader(snap)
+
+    async def delete_snapshot(self, snapshot_number_1_based: int) -> None:
+        """Delete a snapshot slot (SHOW_SNAPSHOT op 3: [3, id, epoch]).
+
+        Snapshot opcode table, determined by protocol analysis: 1 = LOAD/recall,
+        2 = STORE/save, 3 = DELETE, 5 = NAME/rename. Rename needs no separate
+        opcode: op 5 carries the new name.
+        """
+        snap = int(snapshot_number_1_based)
+        if not 1 <= snap <= 99:
+            raise ValueError("snapshot_number must be 1..99")
+        body = struct.pack(">III", 3, snap, int(time.time()))
+        await self.send_request(MackieCommand.SHOW_SNAPSHOT, body)
+        self._snapshot_names.pop(snap, None)
+        self._notify_snapshot_names()
+
+    async def reboot(self, mode: int = 1) -> None:
+        """Reboot the mixer (cmd 0x05, body [mode]; 1 = normal, 2 = updater).
+
+        DANGEROUS: drops audio and every client connection. The (2) variant is
+        what the app sends after PROCESS FILES in a firmware update and after
+        network-config changes.
+        """
+        if int(mode) not in (1, 2):
+            raise ValueError("reboot mode must be 1 or 2")
+        await self.send_request(MackieCommand.REBOOT, struct.pack(">I", int(mode)))
+
+    # --- transport + show control (protocol-analysis-derived formats) ----
+    #
+    # Command 0x0E is one GET family with body[0] subtypes: our general-info
+    # types (2/3/7/18) and transport status (8 = TRANSPORT, 9 = MULTITRACK,
+    # 10 = MUSIC). Replies carry the discriminator in body[0] and payload
+    # from body word 1 on; payloads are opaque status blobs.
+
+    _TRANSPORT_SUBTYPES = {"transport": 8, "multitrack": 9, "music": 10}
+
+    async def get_transport_status(self, kind: str = "transport") -> MackieMessage:
+        """Ask for transport/multitrack/music status (0x0E body [8/9/10])."""
+        try:
+            subtype = self._TRANSPORT_SUBTYPES[str(kind).lower()]
+        except KeyError:
+            raise ValueError("kind must be transport, multitrack or music")
+        return await self.request_general_info(subtype)
+
+    # --- device admin (0x0E GET family / 0x0F SET family) ---------------------
+    #
+    # One generic builder covers every GET: body [selector]. Sub-opcodes
+    # determined from the system-status command family
+    # miner): 1 boot code, 2 max message words, 3 device name, 4 IP address,
+    # 5 lock status, 6 static IP config, 7 subdevice name, 8/9/10 transport,
+    # 0x12 network config, 0x13 site survey. Strings on the wire are
+    # word-swapped like everything else.
+
+    @staticmethod
+    def _info_string(body: bytes) -> str:
+        """Decode a NUL-terminated ASCII string starting at body word 1."""
+        if len(body) < 8:
+            return ""
+        return word_swap(body[4:]).split(b"\x00", 1)[0].decode("ascii", "replace")
+
+    @staticmethod
+    def _info_ipv4(word: int) -> str:
+        import socket as _socket
+
+        return _socket.inet_ntoa(struct.pack(">I", int(word) & 0xFFFFFFFF))
+
+    async def get_device_name(self, timeout: float = 10.0) -> str:
+        """Read the mixer device name (0x0E body [3])."""
+        return self._info_string((await self.request_general_info(3, timeout)).body)
+
+    async def get_subdevice_name(self, timeout: float = 10.0) -> str:
+        """Read the option-card subdevice name (0x0E body [7])."""
+        return self._info_string((await self.request_general_info(7, timeout)).body)
+
+    async def get_ip_address(self, timeout: float = 10.0) -> str:
+        """Read the mixer IPv4 address (0x0E body [4], reply [4, ip])."""
+        body = (await self.request_general_info(4, timeout)).body
+        if len(body) < 8:
+            raise MackieProtocolError("IP address reply too short")
+        return self._info_ipv4(struct.unpack_from(">I", body, 4)[0])
+
+    async def get_lock_status(self, timeout: float = 10.0) -> int:
+        """Read the show-lock word (0x0E body [5], reply [5, lock32])."""
+        body = (await self.request_general_info(5, timeout)).body
+        if len(body) < 8:
+            raise MackieProtocolError("Lock status reply too short")
+        return struct.unpack_from(">I", body, 4)[0]
+
+    async def get_static_ip_config(self, timeout: float = 10.0) -> dict:
+        """Read the static-IP config (0x0E body [6], reply [6, flag, ip, mask, gw])."""
+        body = (await self.request_general_info(6, timeout)).body
+        if len(body) < 20:
+            raise MackieProtocolError("Static IP config reply too short")
+        flag, ip, mask, gw = struct.unpack_from(">IIII", body, 4)
+        return {
+            "static": bool(flag),
+            "address": self._info_ipv4(ip),
+            "mask": self._info_ipv4(mask),
+            "gateway": self._info_ipv4(gw),
+        }
+
+    async def get_max_message_words(self, timeout: float = 10.0) -> int:
+        """Read the max message size in words (0x0E body [2], reply [2, n])."""
+        body = (await self.request_general_info(2, timeout)).body
+        if len(body) < 8:
+            raise MackieProtocolError("Max message words reply too short")
+        return struct.unpack_from(">I", body, 4)[0]
+
+    async def get_network_config(self, timeout: float = 10.0) -> list[int]:
+        """Read the 65-word NetworkInfo struct (0x0E body [0x12]).
+
+        Reply is 66 words; returns words 1..65 verbatim (opaque struct).
+        """
+        body = (await self.request_general_info(0x12, timeout)).body
+        if len(body) < 4 + 65 * 4:
+            raise MackieProtocolError("Network config reply too short")
+        return list(struct.unpack_from(">65I", body, 4))
+
+    async def site_survey(self, timeout: float = 15.0) -> list[tuple]:
+        """Run a Wi-Fi site survey (0x0E body [0x13]).
+
+        Reply: word1 = entry count N, then N x 11-word entries.
+        """
+        body = (await self.request_general_info(0x13, timeout)).body
+        if len(body) < 8:
+            return []
+        (count,) = struct.unpack_from(">I", body, 4)
+        entries = []
+        for i in range(min(count, (len(body) - 8) // 44)):
+            entries.append(struct.unpack_from(">11I", body, 8 + i * 44))
+        return entries
+
+    async def set_device_name(self, name: str, timeout: float = 10.0) -> None:
+        """Set the mixer device name (0x0F body [3, ...string words])."""
+        text = str(name).encode("ascii", "replace")[:1019]
+        padded = text + b"\x00" * ((-len(text) - 1) % 4 + 1)
+        body = struct.pack(">I", 3) + word_swap(padded)
+        await self.send_request(MackieCommand.SET_SYSTEM_STATE, body, timeout=timeout)
+
+    async def set_static_ip_config(
+        self,
+        static: bool,
+        address: str,
+        mask: str,
+        gateway: str,
+        timeout: float = 10.0,
+    ) -> None:
+        """Set static IP config (0x0F body [6, flag, ip, mask, gw]).
+
+        WARNING: a wrong address can strand the mixer off-network. The mixer
+        reboots itself after applying network changes.
+        """
+        import socket as _socket
+
+        def _pack_ip(s: str) -> int:
+            return struct.unpack(">I", _socket.inet_aton(s))[0]
+
+        body = struct.pack(
+            ">IIIII",
+            6,
+            1 if static else 0,
+            _pack_ip(address),
+            _pack_ip(mask),
+            _pack_ip(gateway),
+        )
+        await self.send_request(MackieCommand.SET_SYSTEM_STATE, body, timeout=timeout)
+
+    async def get_show_info(self, timeout: float = 10.0) -> MackieMessage:
+        """Ask for show info (FILE_INFO body [5])."""
+        return await self.send_request(
+            MackieCommand.FILE_INFO, struct.pack(">I", 5), timeout=timeout
+        )
+
+    async def show_ok(self) -> None:
+        """Send SHOW OK (SHOW_SNAPSHOT body [10]), fire-and-forget."""
+        await self._write_message_no_response(
+            MackieMessageType.REQUEST,
+            MackieCommand.SHOW_SNAPSHOT,
+            struct.pack(">I", 10),
+        )
+
+    async def get_show_crc(self, pid: int, timeout: float = 10.0) -> MackieMessage:
+        """Ask for a show/file CRC (SHOW_STATUS body [pid, 0x10400]).
+
+        ``pid``is device-side state (u32 from the transfer object); pass it
+        explicitly until a live trial pins down the show-push value.
+        """
+        return await self.send_request(
+            MackieCommand.SHOW_STATUS,
+            struct.pack(">II", int(pid) & 0xFFFFFFFF, 0x00010400),
+            timeout=timeout,
+        )
+
+    async def set_show_parameter(self, pid: int, value: int) -> None:
+        """Write a show parameter (0x13 body [pid, 0x10300, value]).
+
+        Same builder as SET FILE CRC with type byte 3 instead of 4.
+        """
+        body = struct.pack(
+            ">III", int(pid) & 0xFFFFFFFF, 0x00010300, int(value) & 0xFFFFFFFF
+        )
+        await self.send_request(MackieCommand.CHANNEL_VALUES, body)
+
+    async def set_show_name(self, pid: int, name: str) -> None:
+        """Set the show name (0x18 body [pid, 0x10300, word-swapped name])."""
+        text = str(name).encode("ascii", "replace")[:63]
+        padded = text + b"\x00" * (4 - len(text) % 4 if len(text) % 4 else 4)
+        body = struct.pack(">II", int(pid) & 0xFFFFFFFF, 0x00010300) + word_swap(padded)
+        await self.send_request(MackieCommand.CHANNEL_NAMES, body)
+
+    async def disconnect_notice(self) -> None:
+        """Tell the mixer this client is leaving (cmd 0x06 body [1, 4]).
+
+        Polite form of close(); the app sends it when tearing down for an
+        update. Plain close() stays silent by default.
+        """
+        await self.send_request(
+            MackieCommand.CHANNEL_INFO_CONTROL, struct.pack(">II", 1, 4)
+        )
 
 
 #: Snapshot records inside Show.dat: fixed 72-byte records starting at 0x01a8,
@@ -1158,7 +1907,7 @@ def _build_channel_values_set(
     """
     Build a 'channel values' message body that sets a single address.
 
-    Per determined docs:
+    Per the protocol docs:
       chunk0 = start address
       chunk1 = Count:16 | Type:8 | Unknown:8
       remaining chunks: one 4-byte value per address
@@ -1185,6 +1934,32 @@ def _build_channel_values_set(
         # Fader positions use IEEE float big-endian **dB**, not a 0..1 linear level.
         out.extend(struct.pack(">f", float(value_float)))
     return bytes(out)
+
+
+def _pack_channel_name(name: str) -> bytes:
+    """Encode one name as a CHANNEL_NAMES payload.
+
+    ASCII, NUL-terminated, zero-padded to a whole word, then word-swapped
+    (SPEC.md, "Names" and "Text is word-swapped"). A full extra NUL word is
+    appended when the text already ends on a word boundary, so the payload
+    always carries at least one terminator - an unnamed slot is a bare NUL
+    that still consumes an index.
+    """
+    raw = str(name).encode("ascii", "replace")[:63]
+    pad = 4 - len(raw) % 4 if len(raw) % 4 else 4
+    return word_swap(raw + b"\x00" * pad)
+
+
+def _build_channel_name_write(slot: int, name: str) -> bytes:
+    """Build a CHANNEL_NAMES (0x18) body writing one name slot.
+
+    SPEC.md, "Names": the body layout matches CHANNEL_VALUES - chunk0 = start
+    slot, chunk1 = count:16 | type:8 | unknown:8 - and the payload is a
+    word-swapped stream of NUL-terminated names. Type 5, count 1, unknown 0,
+    which is what request_channel_names uses for the read direction too.
+    """
+    meta = ((1 & 0xFFFF) << 16) | ((VALUE_TYPE_PARAM & 0xFF) << 8)
+    return struct.pack(">II", int(slot) & 0xFFFFFFFF, meta) + _pack_channel_name(name)
 
 
 # Matches DigiMixer's DbFaderScale(-120, -60, -40, -30, -20, -10, -5, 0, 5, 10)

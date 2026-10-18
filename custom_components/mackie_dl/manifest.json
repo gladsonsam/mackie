@@ -1,11 +1,13 @@
 {
   "domain": "mackie_dl",
   "name": "Mackie DL (TCP)",
-  "codeowners": ["@gladsonsam"],
+  "codeowners": [
+    "@gladsonsam"
+  ],
   "config_flow": true,
   "documentation": "https://github.com/gladsonsam/mackie/blob/main/README.md",
   "integration_type": "device",
   "iot_class": "local_push",
   "requirements": [],
-  "version": "0.3.0"
+  "version": "0.4.1"
 }

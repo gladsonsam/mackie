@@ -7,6 +7,7 @@ import struct
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_HOST, CONF_PORT
 from homeassistant.core import HomeAssistant, ServiceResponse, SupportsResponse
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import entity_registry as er
 
 from .addressmap import get_map
@@ -39,10 +40,27 @@ _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS: list[str] = ["switch", "number", "select"]
 
+#: Every service this integration owns, so unload can take them all with it.
+_SERVICES = (
+    SERVICE_SET_PARAMETER,
+    SERVICE_GET_PARAMETER,
+    SERVICE_SET_INPUT_MUTE,
+    SERVICE_SET_INPUT_FADER,
+    SERVICE_RECALL_SNAPSHOT,
+    SERVICE_RAW_SET_VALUE,
+    SERVICE_SET_MUTE_GROUP,
+    SERVICE_SAVE_SNAPSHOT,
+    SERVICE_REFRESH_SNAPSHOT_NAMES,
+)
+
 #: How often to ask the mixer to re-send its whole value space. State arrives by
 #: push, so this only guards against a dropped update; it is not how state is kept
 #: current. Each resync moves 5257 values on a DL32S.
 RESYNC_INTERVAL_SECONDS = 60
+#: Retry cadence while the mixer is unreachable (rack power cycle). Fast enough
+#: that the integration is back within seconds of the desk returning, cheap
+#: enough to run all night: a failed connect is one TCP SYN, no traffic after.
+_RECONNECT_SECONDS = 10
 
 
 def _as_bool(value) -> bool:
@@ -133,7 +151,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         _LOGGER.warning("Could not read snapshot names from %s: %s", host, err)
 
     async def _poll_loop() -> None:
-        """Periodically re-ask the mixer to emit channel values.
+        """Periodically re-ask the mixer to emit channel values, and heal drops.
 
         This is a resync safety net, not the main path: the mixer pushes state
         changes as they happen. CHANNEL_INFO_CONTROL type 6 makes it re-send the
@@ -141,18 +159,41 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         missed update - but it is expensive, hence the slow interval. Values that
         have not changed are filtered out before reaching listeners, so a resync
         produces no entity churn.
+
+        The rack power-cycles with every service, so the mixer routinely
+        vanishes mid-evening. When the resync fails, the loop switches to a
+        fast cadence and drives client.ensure_connected() until the mixer is
+        back - no HA reload needed. Snapshot names are re-seeded on each
+        reconnect (best-effort; the desk can refuse Show.zip reads).
         """
+        down = False
         try:
             while True:
-                await asyncio.sleep(RESYNC_INTERVAL_SECONDS)
+                await asyncio.sleep(
+                    _RECONNECT_SECONDS if down else RESYNC_INTERVAL_SECONDS
+                )
                 try:
+                    if not await client.ensure_connected():
+                        down = True
+                        continue
+                    if down:
+                        down = False
+                        try:
+                            await client.refresh_snapshot_names()
+                        except Exception as err:
+                            _LOGGER.warning(
+                                "Reconnected to %s but could not re-read "
+                                "snapshot names: %s",
+                                host,
+                                err,
+                            )
                     await client.send_request(
                         MackieCommand.CHANNEL_INFO_CONTROL,
                         bytes([0, 0, 0, 6]),
                         timeout=3.0,
                     )
                 except Exception:
-                    pass
+                    down = True
         except asyncio.CancelledError:
             return
 
@@ -164,6 +205,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         "channels": channels,
         "snapshot_recall_address": snapshot_recall_address,
         "snapshot_slots": min(snapshot_slots, 64),
+        "mixer_model": str(mixer_model),
         # MUST be a background task. hass.async_create_task() registers a task that
         # HA waits for while finishing startup, and this loop never returns - which
         # stalled bootstrap until it timed out ("Setup timed out for bootstrap
@@ -175,10 +217,31 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     entry.async_on_unload(entry.add_update_listener(_update_listener))
 
+    # Services are registered ONCE, by whichever entry sets up first, and are
+    # never re-registered on a reload. A handler that closes over `client` keeps
+    # writing to the client that the reload has already closed, so every call
+    # fails with "Not connected" - while the entities, which are rebuilt on each
+    # setup, carry on working. That asymmetry is what makes it hard to spot: the
+    # mute switches respond and the snapshot services do not. Resolve the live
+    # objects out of hass.data at call time instead of capturing them here.
+    def _live() -> dict:
+        entries = hass.data.get(DOMAIN, {})
+        data = entries.get(entry.entry_id)
+        if data is None and len(entries) == 1:
+            # This registration outlived its own entry, but another mixer is
+            # loaded and is the only candidate - use it rather than fail.
+            data = next(iter(entries.values()))
+        if data is None:
+            raise HomeAssistantError("Mackie DL is not loaded")
+        return data
+
+    def _client() -> MackieClient:
+        return _live()["client"]
+
     async def handle_set_mute(call):
         ch = int(call.data["channel"])
         muted = bool(call.data["muted"])
-        await client.set_input_mute(ch, muted)
+        await _client().set_input_mute(ch, muted)
 
     async def handle_set_fader(call):
         ch = int(call.data["channel"])
@@ -187,43 +250,41 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             pct = 0.0
         if pct > 100.0:
             pct = 100.0
-        await client.set_input_fader_level(ch, pct / 100.0)
+        await _client().set_input_fader_level(ch, pct / 100.0)
 
     async def handle_recall_snapshot(call):
         snap = int(call.data["snapshot"])
-        addr = int(hass.data[DOMAIN][entry.entry_id]["snapshot_recall_address"])
-        await client.recall_snapshot(addr, snap)
+        addr = int(_live()["snapshot_recall_address"])
+        await _client().recall_snapshot(addr, snap)
 
     async def handle_set_mute_group(call):
         group = int(call.data["group"])
-        await client.set_mute_group(group, _as_bool(call.data["muted"]))
+        await _client().set_mute_group(group, _as_bool(call.data["muted"]))
 
     async def handle_save_snapshot(call):
         snap = int(call.data["snapshot"])
-        await client.save_snapshot(snap, str(call.data["name"]))
+        await _client().save_snapshot(snap, str(call.data["name"]))
 
     async def handle_refresh_snapshot_names(call) -> ServiceResponse:
-        names = await client.refresh_snapshot_names()
+        names = await _client().refresh_snapshot_names()
         return {"snapshots": {str(k): v for k, v in sorted(names.items())}}
 
     async def handle_raw_set_value(call):
         addr = int(call.data["address"])
         if "int_value" in call.data and call.data["int_value"] is not None:
-            await client.raw_set_value_int(addr, int(call.data["int_value"]))
+            await _client().raw_set_value_int(addr, int(call.data["int_value"]))
         elif "float_value" in call.data and call.data["float_value"] is not None:
-            await client.raw_set_value_float(addr, float(call.data["float_value"]))
+            await _client().raw_set_value_float(addr, float(call.data["float_value"]))
         else:
             raise ValueError("Provide either int_value or float_value")
 
     # --- map-driven generic access ------------------------------------------
     # These two reach every field in addressmap.py. Adding a parameter to the map
     # makes it callable here immediately - no new service, no new entity.
-    mixer_map = get_map(str(mixer_model))
-
     def _resolve(call):
         ch = int(call.data["channel"])
         key = str(call.data["field"])
-        block = mixer_map.inputs
+        block = get_map(str(_live()["mixer_model"])).inputs
         return block, block.field(key), block.address(ch, key)
 
     async def handle_set_parameter(call):
@@ -231,10 +292,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         value = call.data["value"]
 
         if fld.encoding == "bool":
-            await client.raw_set_value_int(address, 1 if _as_bool(value) else 0)
+            await _client().raw_set_value_int(address, 1 if _as_bool(value) else 0)
             return
         if fld.encoding in ("enum", "int"):
-            await client.raw_set_value_int(address, int(value))
+            await _client().raw_set_value_int(address, int(value))
             return
 
         num = float(value)
@@ -242,12 +303,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             raise ValueError(
                 f"{fld.key} must be within {fld.limits[0]}..{fld.limits[1]}, got {num}"
             )
-        await client.raw_set_value_float(address, num)
+        await _client().raw_set_value_float(address, num)
 
     async def handle_get_parameter(call) -> ServiceResponse:
         """Read from the client's cache, which the mixer keeps current by push."""
         block, fld, address = _resolve(call)
-        raw = client.get_cached_u32(address)
+        raw = _client().get_cached_u32(address)
         if raw is None:
             return {"address": address, "field": fld.key, "value": None,
                     "available": False}
@@ -309,6 +370,12 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if poll_task:
             poll_task.cancel()
         await client.close()
+
+    if not hass.data.get(DOMAIN):
+        # Last mixer gone: take the services with it. Leaving them behind is
+        # what let a handler outlive the client it was bound to.
+        for service in _SERVICES:
+            hass.services.async_remove(DOMAIN, service)
 
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     return unload_ok

@@ -46,8 +46,23 @@ class MackieInputMuteSwitch(SwitchEntity):
         self._attr_name = f"Input {desc.channel} mute"
         self._is_on = False
         self._unsub = None
+        self._unsub_conn = None
 
     @property
+    def available(self) -> bool:
+        # False while the mixer is unreachable (rack power cycle); the poll
+        # loop reconnects and pushes resume without an HA reload.
+        return self._client.is_connected
+
+    def _track_connection(self) -> None:
+        self._unsub_conn = self._client.subscribe_connection(
+            lambda _up: self.async_write_ha_state()
+        )
+
+    def _untrack_connection(self) -> None:
+        if self._unsub_conn:
+            self._unsub_conn()
+            self._unsub_conn = None
     def is_on(self) -> bool:
         return self._is_on
 
@@ -63,8 +78,10 @@ class MackieInputMuteSwitch(SwitchEntity):
             self.async_write_ha_state()
 
         self._unsub = self._client.subscribe_value(addr, _on_update)
+        self._track_connection()
 
     async def async_will_remove_from_hass(self) -> None:
+        self._untrack_connection()
         if self._unsub:
             self._unsub()
             self._unsub = None
@@ -101,6 +118,21 @@ class MackieMuteGroupSwitch(SwitchEntity):
         self._is_on: bool | None = client.get_cached_mute_group(group)
         self._unsub_state = None
         self._unsub_name = None
+        self._unsub_conn = None
+
+    @property
+    def available(self) -> bool:
+        return self._client.is_connected
+
+    def _track_connection(self) -> None:
+        self._unsub_conn = self._client.subscribe_connection(
+            lambda _up: self.async_write_ha_state()
+        )
+
+    def _untrack_connection(self) -> None:
+        if self._unsub_conn:
+            self._unsub_conn()
+            self._unsub_conn = None
 
     def _compose_name(self, mixer_name: str | None) -> str:
         # Keep the group number in the entity name: a desk can give two groups
@@ -124,8 +156,10 @@ class MackieMuteGroupSwitch(SwitchEntity):
         self._unsub_name = self._client.subscribe_name(
             mute_group_name_slot(self._group), _on_name
         )
+        self._track_connection()
 
     async def async_will_remove_from_hass(self) -> None:
+        self._untrack_connection()
         for unsub in (self._unsub_state, self._unsub_name):
             if unsub:
                 unsub()

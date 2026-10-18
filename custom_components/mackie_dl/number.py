@@ -49,6 +49,21 @@ class MackieInputFaderNumber(NumberEntity):
         self._attr_name = f"Input {desc.channel} LR level"
         self._value_pct = 0.0
         self._unsub = None
+        self._unsub_conn = None
+
+    @property
+    def available(self) -> bool:
+        return self._client.is_connected
+
+    def _track_connection(self) -> None:
+        self._unsub_conn = self._client.subscribe_connection(
+            lambda _up: self.async_write_ha_state()
+        )
+
+    def _untrack_connection(self) -> None:
+        if self._unsub_conn:
+            self._unsub_conn()
+            self._unsub_conn = None
 
     @property
     def native_value(self) -> float:
@@ -66,8 +81,10 @@ class MackieInputFaderNumber(NumberEntity):
             self.async_write_ha_state()
 
         self._unsub = self._client.subscribe_value(addr, _on_update)
+        self._track_connection()
 
     async def async_will_remove_from_hass(self) -> None:
+        self._untrack_connection()
         if self._unsub:
             self._unsub()
             self._unsub = None

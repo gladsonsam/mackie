@@ -16,7 +16,7 @@
 
 [CmdletBinding()]
 param(
-    [string] $MixerIp = '192.0.2.100',
+    [string] $MixerIp = '192.0.2.100',  # TEST-NET-1 placeholder - pass your mixer's IP
     [string] $OutDir  = (Join-Path $PSScriptRoot 'out')
 )
 

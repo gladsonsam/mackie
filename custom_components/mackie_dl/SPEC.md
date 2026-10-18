@@ -280,7 +280,143 @@ window and you will silently collect a partial dump.
 
 - Firmware may change the layout. Re-run `verify_map.py` after updates.
 - DL16S and DL32R maps are inherited from DigiMixer and unverified here. For the
-  DL16S, the head and send block are safe but the EQ block is not. For the DL32R,
-  trust only mute and fader.
+  DL16S, the head and send block are safe but the EQ block is not.
+- DL32R input stride settled at **132**: protocol analysis shows
+  the `* 0x86 = 134` accessor reads the DL32R **type-2** list, while the input
+  accessor multiplies by 0x84 = 132 with faders landing at 49/181/313... for
+  base 41. Trust mute and fader; the rest of the DL32R map is still DigiMixer
+  inheritance. (An earlier reading had these backwards: the 134-accessor and
+  the 87-stride output accessor index different tables. Open question
+  until a DL32R is on the bench.)
 - Discovery reads are safe on a live mixer. `raw_set_value` sweeps are not: save the
   show first and work with outputs muted.
+
+## Protocol notes (Master Fader wire behavior)
+
+Message formats below were determined by protocol analysis against Master
+Fader 5.2's wire traffic and validated against live hardware; every claim
+names its evidence inline.
+
+### Parameter semantics
+
+The DL32S parameter model resolves to `SNAPSHOT_<CHANNEL>_<PARAM>` keys, e.g.
+`SNAPSHOT_INPUT2_GATE_ATTACK`, `SNAPSHOT_INPUT2_COMP_RATIO`,
+`SNAPSHOT_INPUT2_AUXSEND1_PAN`, `SNAPSHOT_INPUT2_MUTEGROUP3_ASSIGN`,
+`SNAPSHOT_SUB_GROUP_P1_MUTE`, `SNAPSHOT_MAIN_OUT_FADER`,
+`SNAPSHOT_AUX1_FADER`. The ordering independently confirms: gate =
+THRESH/ATTACK/RELEASE/RANGE/HOLD at offsets 19-23, comp =
+GAIN/THRESH/ATTACK/RELEASE/RATIO/KNEE at 26-31, aux sends = FADER/MUTE/PAN
+triples, membership = MUTEGROUP/USERBANK/SUBGROUP/VCA ASSIG at 82-105
+(`USERBANK` keys the view groups in the parameter metadata; the map keeps
+calling them `view`).
+
+Two anomalies to know about. First, EQ band parameter order runs
+TYPE/GAIN/FREQ/Q while the wire order is GAIN/FREQ/Q/TYPE (proven by live
+values: band 4 gain +5.276 dB @35, freq 17250 @36, Q 2.0 @37, type 2 @38).
+The gate 21/22/23 assignment (RELEASE/RANGE/HOLD) rests on that ordering plus
+tuned-value plausibility and still wants a live knob-move confirmation.
+Second, `unknown_16` is resolved: the keys name it `HPF_SLOPE` (constant 2
+everywhere).
+
+### Output strips
+
+A re-read overturned the first layout: subgroup strips are
+**mute-first** (mute 4041+51i, fader 4042+51i; 4049 is COMP ENABLE, not
+mute). MAINOUT is one 87-word strip from **4347** (fader@0, mute@1,
+balance@2, HPF 47-50, LPF 51-54). Aux masters are 8x90 from **4434**
+(mute@3, fader@4). "4395 stride 90" was a misread: 4395 is MAINOUT's HPF
+frequency word. Live corroboration: 4041=0/4042=-120 (x6), 4347=-0.83/4348=0,
+4437=0/4438=+0.83. VCA masters have no value-space strips (app-side only).
+
+### Multi-address writes are (address, value) pairs
+
+Master Fader's CHANNEL_VALUES writes use pairs: chunk0 = addr0, chunk1 =
+meta, chunk2 = val0, then (addrN, valN). The meta count carries a `0x2000`
+flag bit:
+`meta = ((count | 0x2000) << 16) | (type << 8)`. Single-address writes coincide
+with the old layout except for that bit, so existing single-write paths are
+untouched.
+
+**Live correction 2026-10-18:** DL32S firmware parses the pairs layout as
+plain start+count+values — a 2-pair write to {3310, 4297} landed on
+3310/3311/3312 instead (caught by the recorder, restored immediately). So on
+this firmware generation multi-writes fan out to singles in `set_values()`;
+there is deliberately no pairs builder. Singles coincide under both
+interpretations and are proven live in both directions.
+
+### File upload (POST FILE)
+
+Upload sequence: FILE_OPEN (write) -> POST FILE (`0x0D`) chunks ->
+zero-length END chunk -> FILE_CLOSE -> SET FILE CRC -> PROCESS FILES.
+Exact wire forms:
+
+- OPEN (write): body `[file_type] + word_swapped(name)` — the bare type, NO
+  `0x80000000` bit. Downloads use `0x80000000 | type` (observed `0x80000004`
+  for Show.zip); uploads clear the top bit (`word0 = (isWrite << 31) | type`
+  with `isWrite = 0`). Reply `[nonzero, id]` = open,
+  `[0, error 0-3]` = refused.
+- POST chunk: body `[id, total, offset, chunklen] + word_swapped(data)`,
+  zero-padded to a word. Reply `[nonzero]` = ack, and the zero-length chunk at
+  `offset == total` is the END marker (its ack reads `[0]`).
+- CLOSE: body `[id]`. (Downloads close with `[0]`; uploads use the real id.)
+- GET FILE INFO poll: body `[2, id]`, same as downloads.
+- SET FILE CRC: a **0x13 write** `[address, 0x00010400, crc]`. The address
+  comes from the transfer state (not yet pinned for show push — pass
+  explicitly; live trial pending).
+- PROCESS FILES: command `0x06` with single-word body `[10]` (same command
+  value as CHANNEL_INFO_CONTROL, opcode-selected like SHOW_SNAPSHOT).
+
+`upload_file()` implements open/chunks/END/close; CRC/process are separate
+methods. The CRC algorithm is presumed `zlib.crc32` over the plain file bytes;
+confirm on hardware. Upload is EXPERIMENTAL until a live trial.
+
+### Gate/comp offset semantics
+
+The app's channel view (Gate page knobs: Threshold, Range, Attack, Hold,
+Release; Comp page: Threshold, Ratio, Attack, Release, Gain + Soft/Hard Knee)
+plus per-channel value analysis on a live DL32S (32 channels, tuned vs factory
+`[0, 0, 0.1, 250, 2, 0]`) resolves the DSP blocks. Offsets follow DSP struct
+order, NOT UI row order:
+
+- Gate: 19 threshold dB, 20 attack ms (constant 0.1 everywhere), 21 release ms
+  (default 250), 22 hold ms (default 60), 23 range (default 0, tuned 150/160,
+  unit TBD).
+- Comp: 26 gain dB (default 0), 27 threshold dB (default 0, tuned -13..-37),
+  28 attack ms (default 0.1), 29 release ms (default 250), 30 ratio (default
+  2:1), 31 knee (0 = soft everywhere).
+
+Labels are in `addressmap.py` with `verified=False` (no live knob movement was
+observed; that confirmation is still wanted). Aux-send third words are still
+unknown (all zero; pre/post is unconfirmed hypothesis). `unknown_16` reads a
+constant 2 on all channels (possibly HPF slope).
+
+### Type-2 observations (live)
+
+The connect-time type-2 dump IS populated: on the reference desk address 12
+read 1 while mute group 2 was muted, confirming masters 11-16 live (FINDINGS
+section 6 caveat resolved). Type-2 **writes** proven live 2026-10-18: MG6
+master (addr 16) 0->1->0 via `mutegroup`, confirmed by 30 s-settle bulk
+re-reads (bulk carries all 107 values but needs ~15-30 s to arrive; shorter
+settles miss it). Type-2 *push* relay to a second client was NOT observed in
+~10 min of watching — bulk re-reads are the reliable type-2 observer.
+Other nonzero type-2 addresses seen: 1:2, 2:1, 5:2, 6:1, 7:~22.5,
+8:0xFFFFFFFF, 9:1, 10:1, 18:-70.0, 20:20.0, 21:1, 22:4017, 88:-71.4, 106:1.
+Unmapped; documented for the next pass.
+
+### Live-proven write paths (2026-10-18, DL32S)
+
+- Rename (0x18 single-slot): slot 31 -> PROBE -> blank, confirmed by
+  fresh-connection pushes each way.
+- Subgroup mute (4296) 0->1->0 and fader (4297) -120->-119->-120, both
+  relay-observed on a second client; net-zero verified by full re-dump.
+- MG6 master (type-2 addr 16) 0->1->0, confirmed by 30 s bulk re-reads.
+- Device name SET (0x0F) proven with read-back (renamed and restored).
+  verified.
+- Singles writes proven live in both directions (write + relay + read-back).
+- Pairs layout disproven on this firmware (see above).
+- Still blocked mixer-side: file transfer (FILE_INFO op 2 refused with ERROR
+  body 0x0c since the morning service) and transport status (same error).
+  Blocked/unattempted on a service day: show upload+CRC+process, snapshot
+  save/delete (needs Show.zip), main/aux master writes (audible), reboot,
+  static-IP write, gate knob-move semantics (needs UI control).
+

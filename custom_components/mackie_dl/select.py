@@ -60,7 +60,22 @@ class MackieShowSnapshotSelect(RestoreEntity, SelectEntity):
         self._max_slot = max_slot
         self._current: str | None = None
         self._unsub_names = None
+        self._unsub_conn = None
         self._refresh_options()
+
+    @property
+    def available(self) -> bool:
+        return self._client.is_connected
+
+    def _track_connection(self) -> None:
+        self._unsub_conn = self._client.subscribe_connection(
+            lambda _up: self.async_write_ha_state()
+        )
+
+    def _untrack_connection(self) -> None:
+        if self._unsub_conn:
+            self._unsub_conn()
+            self._unsub_conn = None
 
     def _label(self, number: int) -> str:
         """Option label for a slot: the desk's name when it has one.
@@ -128,6 +143,7 @@ class MackieShowSnapshotSelect(RestoreEntity, SelectEntity):
             self.async_write_ha_state()
 
         self._unsub_names = self._client.subscribe_snapshot_names(_on_names)
+        self._track_connection()
 
         if (last := await self.async_get_last_state()) is None:
             return
@@ -143,6 +159,7 @@ class MackieShowSnapshotSelect(RestoreEntity, SelectEntity):
                 self._current = st
 
     async def async_will_remove_from_hass(self) -> None:
+        self._untrack_connection()
         if self._unsub_names:
             self._unsub_names()
             self._unsub_names = None

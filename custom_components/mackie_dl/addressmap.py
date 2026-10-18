@@ -21,7 +21,7 @@ Provenance
 ----------
 Two independent sources agree on the head of the strip:
 
-* ``DL16S``- Jon Skeet's DigiMixer (``jskeet/DemoCode``), determined
+* ``DL16S``- Jon Skeet's DigiMixer (``jskeet/DemoCode``), derived independently
   independently of this project.
 * ``DL32S``- verified here against real hardware by reading the whole
   5257-address value space and checking every field for plausibility across all
@@ -71,9 +71,10 @@ def _sends(prefix: str, label: str, first: int, count: int, stride: int,
            with_third: bool) -> list[Field]:
     """Build a send block.
 
-    Aux sends are (level, non-LR mute, unknown) triples; FX sends drop the third
-    word. The third word read as 0 on all 32 channels of the reference mixer, so
-    it is mapped but flagged unverified rather than guessed at.
+    Aux sends are (level, mute, pan) triples: the app's descriptor table
+    (parameter metadata names the third word PAN: AUXSENDn_FADER/MUTE/PAN)
+    PAN, which reads 0.0 (center, invisible) on every live channel. FX sends
+    are (level, mute) pairs.
     """
     out: list[Field] = []
     for n in range(1, count + 1):
@@ -83,8 +84,9 @@ def _sends(prefix: str, label: str, first: int, count: int, stride: int,
         out.append(Field(f"{prefix}{n}_mute", base + 1, "bool",
                          f"{label} {n} send mute"))
         if with_third:
-            out.append(Field(f"{prefix}{n}_unknown", base + 2, "int",
-                             f"{label} {n} send (unknown)", verified=False))
+            out.append(Field(f"{prefix}{n}_pan", base + 2, "float",
+                             f"{label} {n} send pan", (-1.0, 1.0),
+                             verified=False))
     return out
 
 
@@ -125,22 +127,37 @@ _INPUT_HEAD: list[Field] = [
     Field("phantom", 13, "bool", "48V phantom"),
     Field("hpf_on", 14, "bool", "HPF on"),
     Field("hpf_freq", 15, "float", "HPF frequency", (20.0, 400.0)),  # 125.5 Hz
-    Field("unknown_16", 16, "int", "(unknown)", verified=False),
+    # unknown_16 resolved by parameter metadata cross-check:
+    # HPF slope. Constant 2 on all 32 live channels.
+    Field("hpf_slope", 16, "int", "HPF slope", verified=False),
     Field("gate_mode", 17, "enum", "Gate modern/vintage"),
     Field("gate_on", 18, "bool", "Gate on"),
     Field("gate_threshold", 19, "db", "Gate threshold", (-120.0, 0.0)),  # -80 dB
-    Field("gate_p1", 20, "float", "Gate parameter 1", verified=False),
-    Field("gate_p2", 21, "float", "Gate parameter 2", verified=False),
-    Field("gate_p3", 22, "float", "Gate parameter 3", verified=False),
-    Field("gate_p4", 23, "float", "Gate parameter 4", verified=False),
+    # Gate DSP order THRESH/ATTACK/RELEASE/RANGE/HOLD, corroborated by
+    # cross-channel values (live DL32S): off20 is a constant 0.1
+    # on all 32 channels (attack ms, never touched), off21 defaults 250
+    # with tuned 430/480 (release ms), off22 defaults 60 with tuned 13/40
+    # (range), off23 defaults 0 with tuned 150/160 (hold ms).
+    Field("gate_attack", 20, "float", "Gate attack ms", verified=False),
+    Field("gate_release", 21, "float", "Gate release ms", verified=False),
+    Field("gate_range", 22, "float", "Gate range", verified=False),
+    Field("gate_hold", 23, "float", "Gate hold ms", verified=False),
     Field("comp_mode", 24, "enum", "Comp modern/vintage"),
     Field("comp_on", 25, "bool", "Comp on"),
-    Field("comp_p1", 26, "float", "Comp parameter 1", verified=False),   # 8.9
-    Field("comp_p2", 27, "float", "Comp parameter 2", verified=False),   # -22
-    Field("comp_p3", 28, "float", "Comp parameter 3", verified=False),   # 31
-    Field("comp_p4", 29, "float", "Comp parameter 4", verified=False),   # 99
-    Field("comp_p5", 30, "float", "Comp parameter 5", verified=False),   # 4
-    Field("comp_p6", 31, "float", "Comp parameter 6", verified=False),
+    # Comp DSP order from the app's channel view (Threshold, Ratio, Attack,
+    # Release, Gain sliders + Soft/Hard Knee toggle). Cross-channel evidence:
+    # factory default is [0, 0, 0.1, 250, 2, 0] on untouched channels, i.e.
+    # gain 0 dB, threshold 0 dB, attack 0.1 ms, release 250 ms, ratio 2:1,
+    # knee soft. Tuned channels read e.g. [8.9, -22, 31, 99, 4, 0] =
+    # gain +8.9 dB, threshold -22 dB, attack 31 ms, release 99 ms,
+    # ratio 4:1, knee soft. Offsets follow DSP struct order
+    # (gain, threshold, attack, release, ratio, knee), not UI row order.
+    Field("comp_gain", 26, "db", "Comp makeup gain", verified=False),
+    Field("comp_threshold", 27, "db", "Comp threshold", (-60.0, 20.0), verified=False),
+    Field("comp_attack", 28, "float", "Comp attack ms", verified=False),
+    Field("comp_release", 29, "float", "Comp release ms", verified=False),
+    Field("comp_ratio", 30, "float", "Comp ratio", verified=False),
+    Field("comp_knee", 31, "enum", "Comp knee soft/hard", verified=False),
     Field("eq_mode", 32, "enum", "EQ modern/vintage"),
     Field("eq_on", 33, "bool", "EQ on"),
     Field("eq_bands", 34, "int", "EQ band count"),                       # 4
@@ -236,6 +253,45 @@ DL32S = MixerMap(
         "Stride 106 confirmed 32/32 on both the mute and fader signatures; "
         "strides 100 and 132 scored 22/32 and 21/32."
     ),
+    blocks={
+        # Subgroup master strips (live-dump analysis 2026-10-17/18,
+        # SPEC). Six 51-word strips from 4041: master MUTE at offset 0,
+        # master FADER at offset 1. Proven live 2026-10-18 (sub6 mute
+        # 0->1->0 and fader -120->-119->-120, both relay-observed).
+        "subgroup": ChannelBlock(
+            "subgroup", base=4041, stride=51, count=6,
+            fields=(
+                Field("mute", 0, "bool", "Subgroup master mute"),
+                Field("fader", 1, "db", "Subgroup master fader",
+                      (-120.0, 10.0)),
+            ),
+        ),
+        # Main-out master strip: 87 words from
+        # 4347. Fader at offset 0 (reads -0.83 dB live), mute at offset 1,
+        # balance at offset 2, HPF at 47-50, LPF at 51-54.
+        "main": ChannelBlock(
+            "main", base=4347, stride=87, count=1,
+            fields=(
+                Field("fader", 0, "db", "Main master fader",
+                      (-120.0, 10.0), verified=False),
+                Field("mute", 1, "bool", "Main master mute",
+                      verified=False),
+                Field("balance", 2, "float", "Main balance",
+                      verified=False),
+            ),
+        ),
+        # Aux master strips: 8 strips of 90 words from 4434.
+        # Mute at offset 3, fader at offset 4 (live aux1: 0 / +0.83 dB).
+        "auxmaster": ChannelBlock(
+            "auxmaster", base=4434, stride=90, count=8,
+            fields=(
+                Field("mute", 3, "bool", "Aux master mute",
+                      verified=False),
+                Field("fader", 4, "db", "Aux master fader",
+                      (-120.0, 10.0), verified=False),
+            ),
+        ),
+    },
 )
 
 DL16S = MixerMap(
